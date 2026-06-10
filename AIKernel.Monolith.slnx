@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/AIKernel.Monolith/AIKernel.Monolith.csproj" />
+  <Project Path="tests/AIKernel.Monolith.Tests/AIKernel.Monolith.Tests.csproj" />
+</Solution>

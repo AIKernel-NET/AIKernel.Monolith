@@ -1,0 +1,8 @@
+mounts:
+  - name: root
+    kind: local
+    path: /vfs
+    readonly: true
+rules:
+  writes: denied
+  traversal: denied

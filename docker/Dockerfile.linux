@@ -1,0 +1,3 @@
+FROM aikernel/monolith:base
+ENV AIKERNEL_PLATFORM=linux
+ENV AIKERNEL_NATIVE_ABI=so

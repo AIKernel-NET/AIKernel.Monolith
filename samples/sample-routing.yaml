@@ -1,0 +1,13 @@
+routes:
+  - id: default-chat
+    when:
+      type: chat
+    target:
+      kind: model
+      id: null-model
+  - id: default-tool
+    when:
+      type: tool
+    target:
+      kind: capability
+      id: null.capability

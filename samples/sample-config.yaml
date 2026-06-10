@@ -1,0 +1,12 @@
+monolith:
+  name: AIKernel.Monolith
+  version: 0.1.1
+  mode: deterministic
+mounts:
+  config: /config
+  models: /models
+  vfs: /vfs
+  capabilities: /capabilities
+api:
+  listen: http://0.0.0.0:8080
+  openaiCompatible: true

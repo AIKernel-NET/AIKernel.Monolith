@@ -1,0 +1,9 @@
+{
+  "id": "null.capability",
+  "name": "Null Capability",
+  "version": "0.1.1",
+  "kind": "managed",
+  "operations": [
+    "capability.ping"
+  ]
+}

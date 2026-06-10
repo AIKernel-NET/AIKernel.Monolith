@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aikernel-monolith"
+version = "0.1.1"
+description = "Python CLI wrapper for launching the AIKernel.Monolith Semantic OS distribution container."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Takuya Sogawa" }]
+dependencies = ["click>=8.1", "docker>=7.0", "pyyaml>=6.0"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries",
+]
+
+[project.scripts]
+aikernel = "aikernel_monolith.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/AIKernel-NET/AIKernel.Monolith"
+Repository = "https://github.com/AIKernel-NET/AIKernel.Monolith"
+Documentation = "https://aikernel.net/docs/"
+Issues = "https://github.com/AIKernel-NET/AIKernel.Monolith/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+aikernel_monolith = ["py.typed"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["../tests/python-tests"]
