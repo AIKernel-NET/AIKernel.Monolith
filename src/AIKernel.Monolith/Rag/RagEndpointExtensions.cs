@@ -16,6 +16,16 @@ internal static class RagEndpointExtensions
             ToResult(await rag.IndexAsync(indexId, request, context.TraceIdentifier, cancellationToken),
                 RagJsonContext.Default.RagIndexResponse));
 
+        indexes.MapPut("/documents", async (string indexId, RagDocument request, RagService rag,
+            HttpContext context, CancellationToken cancellationToken) =>
+            ToResult(await rag.UpsertDocumentAsync(indexId, request, context.TraceIdentifier, cancellationToken),
+                RagJsonContext.Default.RagIndexResponse));
+
+        indexes.MapDelete("/documents", async (string indexId, string? documentId, RagService rag,
+            CancellationToken cancellationToken) =>
+            ToResult(await rag.DeleteDocumentAsync(indexId, documentId, cancellationToken),
+                RagJsonContext.Default.RagIndexResponse));
+
         indexes.MapPost("/search", async (string indexId, RagSearchRequest request, RagService rag,
             HttpContext context, CancellationToken cancellationToken) =>
             ToResult(await rag.SearchAsync(indexId, request.Query, request.TopK, context.TraceIdentifier, cancellationToken),

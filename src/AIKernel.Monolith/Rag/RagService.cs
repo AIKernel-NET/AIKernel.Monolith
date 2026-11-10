@@ -10,22 +10,33 @@ internal sealed class RagService(
     MountOptions mounts,
     ModelProviderRegistry registry,
     GovernedModelInference inference,
-    ILogger<RagService> logger)
+    ILogger<RagService> logger) : IDisposable
 {
     private const int ChunkLength = 1000;
+    private const int MaxDocuments = 64;
     private const int MaxChunks = 256;
     private const int BatchSize = 32;
+
+    private readonly SemaphoreSlim indexWriteLock = new(1);
 
     private static readonly InferenceError InvalidIndexId =
         new(400, "invalid_index_id", "Use 1 to 64 lowercase ASCII letters, digits, hyphens or underscores for the index ID.");
     private static readonly InferenceError InvalidDocuments =
         new(400, "invalid_documents", "Provide an embedding model and 1 to 64 valid documents with unique IDs, producing at most 256 chunks.");
+    private static readonly InferenceError InvalidDocument =
+        new(400, "invalid_document", "Provide a valid document ID and non-empty text producing at most 256 chunks.");
+    private static readonly InferenceError InvalidDocumentId =
+        new(400, "invalid_document_id", "Provide a non-empty document ID of up to 128 characters.");
+    private static readonly InferenceError MissingDocument =
+        new(404, "document_not_found", "The requested RAG document does not exist.");
+    private static readonly InferenceError IndexLimitExceeded =
+        new(400, "index_limit_exceeded", "An index can contain at most 64 documents and 256 chunks.");
     private static readonly InferenceError InvalidQuery =
         new(400, "invalid_query", "Provide a non-empty query of up to 4000 characters and a topK between 1 and 10.");
     private static readonly InferenceError MissingIndex =
         new(404, "index_not_found", "The requested RAG index does not exist.");
     private static readonly InferenceError EmbeddingChanged =
-        new(409, "embedding_model_changed", "The embedding model has changed. Rebuild the index before searching it.");
+        new(409, "embedding_model_changed", "The embedding model has changed. Rebuild the index to use the configured embedding model.");
     private static readonly InferenceError NoEvidence =
         new(422, "no_context", "No indexed chunks with positive similarity were found.");
     private static readonly InferenceError InvalidVectors =
@@ -42,18 +53,107 @@ internal sealed class RagService(
         }
 
         if (string.IsNullOrWhiteSpace(request.EmbeddingModel) ||
-            request.Documents is not { Length: > 0 and <= 64 } documents ||
+            request.Documents is not { Length: > 0 and <= MaxDocuments } documents ||
             PrepareChunks(documents) is not { } input)
         {
             return new(Error: InvalidDocuments);
         }
 
+        var embedded = await EmbedChunksAsync(request.EmbeddingModel, input, requestId, "rag.index", cancellationToken);
+        if (embedded.Error is { } error)
+        {
+            return new(Error: error);
+        }
+
+        var index = new RagIndex(DescribeEmbeddingModel(registry.Find(request.EmbeddingModel)!), embedded.Value!);
+        return await WriteIndexAsync(indexId, () => Task.FromResult(new InferenceOutcome<RagIndex>(Value: index)),
+            cancellationToken);
+    }
+
+    internal async Task<InferenceOutcome<RagIndexResponse>> UpsertDocumentAsync(
+        string indexId, RagDocument document, string requestId, CancellationToken cancellationToken)
+    {
+        if (!IsValidIndexId(indexId))
+        {
+            return new(Error: InvalidIndexId);
+        }
+
+        if (PrepareChunks([document]) is not { } input)
+        {
+            return new(Error: InvalidDocument);
+        }
+
+        var current = await LoadIndexAsync(indexId, cancellationToken);
+        if (current.Error is { } loadError)
+        {
+            return new(Error: loadError);
+        }
+
+        var model = current.Value!.EmbeddingModel;
+        if (HasEmbeddingModelChanged(model))
+        {
+            return new(Error: EmbeddingChanged);
+        }
+
+        var embedded = await EmbedChunksAsync(model.Id, input, requestId, "rag.document.upsert", cancellationToken);
+        if (embedded.Error is { } embedError)
+        {
+            return new(Error: embedError);
+        }
+
+        var newChunks = embedded.Value!;
+        return await UpdateIndexAsync(indexId, index =>
+        {
+            if (index.EmbeddingModel != model ||
+                (index.Chunks.Length > 0 && index.Chunks[0].Vector.Length != newChunks[0].Vector.Length))
+            {
+                return new(Error: EmbeddingChanged);
+            }
+
+            var retained = index.Chunks.Where(chunk => chunk.Source.DocumentId != document.Id).ToArray();
+            if (retained.Length + newChunks.Length > MaxChunks || CountDocuments(retained) >= MaxDocuments)
+            {
+                return new(Error: IndexLimitExceeded);
+            }
+
+            return new(Value: index with { Chunks = [.. retained, .. newChunks] });
+        }, cancellationToken);
+    }
+
+    internal Task<InferenceOutcome<RagIndexResponse>> DeleteDocumentAsync(
+        string indexId, string? documentId, CancellationToken cancellationToken)
+    {
+        if (!IsValidIndexId(indexId))
+        {
+            return Task.FromResult(new InferenceOutcome<RagIndexResponse>(Error: InvalidIndexId));
+        }
+
+        if (!IsValidDocumentId(documentId))
+        {
+            return Task.FromResult(new InferenceOutcome<RagIndexResponse>(Error: InvalidDocumentId));
+        }
+
+        return UpdateIndexAsync(indexId, index =>
+        {
+            var retained = index.Chunks.Where(chunk => chunk.Source.DocumentId != documentId).ToArray();
+            return retained.Length == index.Chunks.Length
+                ? new(Error: MissingDocument)
+                : new(Value: index with { Chunks = retained });
+        }, cancellationToken);
+    }
+
+    public void Dispose() => indexWriteLock.Dispose();
+
+    private async Task<InferenceOutcome<RagChunk[]>> EmbedChunksAsync(
+        string modelId, List<(RagSource Source, string Text)> input, string requestId, string operation,
+        CancellationToken cancellationToken)
+    {
         var chunks = new List<RagChunk>(input.Count);
         var dimension = 0;
         foreach (var batch in input.Chunk(BatchSize))
         {
-            var embeddings = await inference.EmbedAsync(request.EmbeddingModel,
-                batch.Select(chunk => chunk.Text).ToArray(), requestId, cancellationToken, "rag.index");
+            var embeddings = await inference.EmbedAsync(modelId,
+                batch.Select(chunk => chunk.Text).ToArray(), requestId, cancellationToken, operation);
             if (embeddings.Error is { } error)
             {
                 return new(Error: error);
@@ -77,8 +177,44 @@ internal sealed class RagService(
             }
         }
 
-        var embeddingModel = DescribeEmbeddingModel(registry.Find(request.EmbeddingModel)!);
-        var index = new RagIndex(embeddingModel, chunks.ToArray());
+        return new(Value: chunks.ToArray());
+    }
+
+    private Task<InferenceOutcome<RagIndexResponse>> UpdateIndexAsync(
+        string indexId, Func<RagIndex, InferenceOutcome<RagIndex>> update, CancellationToken cancellationToken)
+        => WriteIndexAsync(indexId, async () =>
+        {
+            var current = await LoadIndexAsync(indexId, cancellationToken);
+            return current.Error is { } error ? new(Error: error) : update(current.Value!);
+        }, cancellationToken);
+
+    private async Task<InferenceOutcome<RagIndexResponse>> WriteIndexAsync(
+        string indexId, Func<Task<InferenceOutcome<RagIndex>>> prepare, CancellationToken cancellationToken)
+    {
+        await indexWriteLock.WaitAsync(cancellationToken);
+        try
+        {
+            // Merge mutations against the latest snapshot after provider calls have finished.
+            var outcome = await prepare();
+            if (outcome.Error is { } error)
+            {
+                return new(Error: error);
+            }
+
+            var index = outcome.Value!;
+            return await SaveIndexAsync(indexId, index, cancellationToken)
+                ? new(Value: new RagIndexResponse(indexId, index.EmbeddingModel.Id,
+                    CountDocuments(index.Chunks), index.Chunks.Length))
+                : new(Error: StorageUnavailable);
+        }
+        finally
+        {
+            indexWriteLock.Release();
+        }
+    }
+
+    private async Task<bool> SaveIndexAsync(string indexId, RagIndex index, CancellationToken cancellationToken)
+    {
         var path = IndexPath(indexId);
         var temporary = path + $".{Guid.NewGuid():N}.tmp";
         try
@@ -91,12 +227,12 @@ internal sealed class RagService(
 
             cancellationToken.ThrowIfCancellationRequested();
             File.Move(temporary, path, overwrite: true);
-            return new(Value: new RagIndexResponse(indexId, request.EmbeddingModel, documents.Length, chunks.Count));
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             logger.LogError(ex, "Could not save RAG index {IndexId}", indexId);
-            return new(Error: StorageUnavailable);
+            return false;
         }
         finally
         {
@@ -165,30 +301,19 @@ internal sealed class RagService(
             return new(Error: InvalidQuery);
         }
 
-        RagIndex? index;
-        try
+        var current = await LoadIndexAsync(indexId, cancellationToken);
+        if (current.Error is { } loadError)
         {
-            await using var stream = new FileStream(IndexPath(indexId), FileMode.Open, FileAccess.Read,
-                FileShare.Read | FileShare.Delete);
-            index = await JsonSerializer.DeserializeAsync(stream, RagJsonContext.Default.RagIndex, cancellationToken);
-        }
-        catch (IOException ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
-        {
-            return new(Error: MissingIndex);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
-        {
-            logger.LogError(ex, "Could not load RAG index {IndexId}", indexId);
-            return new(Error: StorageUnavailable);
+            return new(Error: loadError);
         }
 
-        if (index is not { EmbeddingModel.Id.Length: > 0, Chunks.Length: > 0 and <= MaxChunks })
+        var index = current.Value!;
+        if (index.Chunks.Length == 0)
         {
-            return new(Error: StorageUnavailable);
+            return new(Value: new RagSearchResponse(indexId, []));
         }
 
-        var model = registry.Find(index.EmbeddingModel.Id);
-        if (model is not null && DescribeEmbeddingModel(model) != index.EmbeddingModel)
+        if (HasEmbeddingModelChanged(index.EmbeddingModel))
         {
             return new(Error: EmbeddingChanged);
         }
@@ -210,11 +335,6 @@ internal sealed class RagService(
         foreach (var chunk in index.Chunks)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (chunk is not { Vector.Length: > 0, Source: not null, Text: not null })
-            {
-                return new(Error: StorageUnavailable);
-            }
-
             if (vector.Length != chunk.Vector.Length)
             {
                 return new(Error: EmbeddingChanged);
@@ -242,14 +362,52 @@ internal sealed class RagService(
         return new(Value: new RagSearchResponse(indexId, hits));
     }
 
+    private async Task<InferenceOutcome<RagIndex>> LoadIndexAsync(string indexId, CancellationToken cancellationToken)
+    {
+        RagIndex? index;
+        try
+        {
+            await using var stream = new FileStream(IndexPath(indexId), FileMode.Open, FileAccess.Read,
+                FileShare.Read | FileShare.Delete);
+            index = await JsonSerializer.DeserializeAsync(stream, RagJsonContext.Default.RagIndex, cancellationToken);
+        }
+        catch (IOException ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return new(Error: MissingIndex);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            logger.LogError(ex, "Could not load RAG index {IndexId}", indexId);
+            return new(Error: StorageUnavailable);
+        }
+
+        if (index is not { EmbeddingModel.Id.Length: > 0, Chunks.Length: <= MaxChunks } ||
+            index.Chunks.Any(chunk => chunk is not { Vector.Length: > 0, Source: not null, Text: not null } ||
+                !IsValidDocumentId(chunk.Source.DocumentId)))
+        {
+            return new(Error: StorageUnavailable);
+        }
+
+        return new(Value: index);
+    }
+
+    private bool HasEmbeddingModelChanged(RagEmbeddingModel model)
+        => registry.Find(model.Id) is { } registered && DescribeEmbeddingModel(registered) != model;
+
+    private static int CountDocuments(RagChunk[] chunks)
+        => chunks.Select(chunk => chunk.Source.DocumentId).Distinct(StringComparer.Ordinal).Count();
+
+    private static bool IsValidDocumentId(string? id)
+        => id is { Length: <= 128 } && !string.IsNullOrWhiteSpace(id);
+
     private static List<(RagSource Source, string Text)>? PrepareChunks(RagDocument?[] documents)
     {
         var ids = new HashSet<string>(StringComparer.Ordinal);
         var chunks = new List<(RagSource Source, string Text)>();
         foreach (var document in documents)
         {
-            if (document is not { Id.Length: > 0 and <= 128, Text.Length: > 0 and <= ChunkLength * MaxChunks } ||
-                string.IsNullOrWhiteSpace(document.Id) || string.IsNullOrWhiteSpace(document.Text) ||
+            if (document is not { Id: not null, Text.Length: > 0 and <= ChunkLength * MaxChunks } ||
+                !IsValidDocumentId(document.Id) || string.IsNullOrWhiteSpace(document.Text) ||
                 document.Title?.Length > 512 || document.Source?.Length > 2048 || !ids.Add(document.Id))
             {
                 return null;

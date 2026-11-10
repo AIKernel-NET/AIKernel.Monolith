@@ -5,6 +5,7 @@ namespace AIKernel.Monolith.Internal;
 
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 [JsonSerializable(typeof(RagIndexRequest))]
+[JsonSerializable(typeof(RagDocument))]
 [JsonSerializable(typeof(RagIndexResponse))]
 [JsonSerializable(typeof(RagSearchRequest))]
 [JsonSerializable(typeof(RagSearchResponse))]

@@ -1,4 +1,5 @@
 """Exercise document indexing, search, and grounded inference in a published Native AOT Monolith."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from urllib.parse import urlencode
 
 
 helpers = runpy.run_path(str(Path(__file__).with_name("native-aot-stream-embeddings.py")))
@@ -21,10 +23,15 @@ audit_entries = helpers["audit_entries"]
 
 KEY = "native-rag-test-only-key"
 INDEX = "/v1/rag/indexes/handbook"
+DOCUMENTS = INDEX + "/documents"
 QUESTION = "What is the orbital period?"
 FACT = "The orbital period of the example planet is 37 days."
 OTHER = "The accounting office closes at noon."
 ANSWER = "The orbital period is 37 days [1]."
+UPDATED_FACT = "The orbital period of the example planet is 41 days."
+BACKUP_FACT = "The calendar records an orbital period of 53 days."
+EXTRA_FACT = "The astronomical almanac records the example planet."
+BACKUP_ID = "reference/暦"
 PREFIX = "A" * 998 + "  "
 FAILED_CHUNK = "B" * 1000
 
@@ -41,10 +48,13 @@ def smoke(exe, output):
             directory.mkdir()
         audit = roots["config"] / "inference-audit.jsonl"
         calls = []
+        concurrent_adds = threading.Barrier(2, timeout=10)
 
         class Upstream(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = read_request(self)
+                if body.get("input") in ([BACKUP_FACT], [EXTRA_FACT]):
+                    concurrent_adds.wait()
                 decision = audit_entries(audit)[-1]
                 assert decision["EventType"] == "inference.policy" and decision["Description"] == "allowed"
                 calls.append((self.path, body))
@@ -57,7 +67,8 @@ def smoke(exe, output):
                         return
                     vectors = {PREFIX.strip(): [1, 1, 0], FACT: [3, 0, 0], OTHER: [-2, 0, 0],
                                QUESTION: [2, 0, 0], "No matches": [0, 0, 1], "zero vector": [0, 0, 0],
-                               FAILED_CHUNK: [0, 1, 0]}
+                               FAILED_CHUNK: [0, 1, 0], UPDATED_FACT: [4, 0, 0],
+                               BACKUP_FACT: [1, 1, 0], EXTRA_FACT: [1, 2, 0]}
                     self.send_json(200, {"data": [{"index": i, "embedding": vectors[texts[i]]}
                                                  for i in reversed(range(len(texts)))]})
                     return
@@ -68,8 +79,8 @@ def smoke(exe, output):
                 assert system["role"] == "system" and "citation labels" in system["content"]
                 assert user["role"] == "user" and user["content"].endswith("\n\nQuestion:\n" + QUESTION)
                 evidence = json.loads(user["content"].split("\n", 1)[1].split("\n\nQuestion:", 1)[0])
-                assert evidence == expected_search["hits"][:1]
-                self.send_json(200, {"choices": [{"message": {"content": ANSWER}}]})
+                assert evidence == expected_evidence
+                self.send_json(200, {"choices": [{"message": {"content": expected_answer}}]})
 
             def send_json(self, status, payload):
                 encoded = json.dumps(payload).encode()
@@ -125,7 +136,7 @@ def smoke(exe, output):
                 if key is not None:
                     headers["Authorization"] = f"Bearer {key}"
                 with closing(HTTPConnection("127.0.0.1", port, timeout=15)) as connection:
-                    connection.request(method, route, json.dumps(payload), headers)
+                    connection.request(method, route, json.dumps(payload) if payload is not None else None, headers)
                     response = connection.getresponse()
                     data = response.read()
                     assert response.status == status, (method, route, status, response.status, data)
@@ -133,6 +144,13 @@ def smoke(exe, output):
 
             def put(port, model_id, docs, status=200, key=KEY):
                 return request(port, INDEX, {"embeddingModel": model_id, "documents": docs}, status, "PUT", key)
+
+            def upsert(port, document, status=200, key=KEY):
+                return request(port, DOCUMENTS, document, status, "PUT", key)
+
+            def delete(port, document_id, status=200, key=KEY):
+                route = DOCUMENTS + "?" + urlencode({"documentId": document_id})
+                return request(port, route, None, status, "DELETE", key)
 
             query = {"query": QUESTION}
             question = {"model": "chat", "question": QUESTION, "topK": 1}
@@ -147,6 +165,8 @@ def smoke(exe, output):
                     assert put(port, "embed", [docs[0], docs[0]], 400)["error"]["code"] == "invalid_documents"
                     assert put(port, "missing", docs, 404)["error"]["code"] == "model_not_found"
                     assert put(port, "denied", docs, 403)["error"]["code"] == "policy_denied"
+                    assert upsert(port, docs[0], 404)["error"]["code"] == "index_not_found"
+                    assert delete(port, "planet", 404)["error"]["code"] == "index_not_found"
                     assert not calls
                     assert put(port, "embed", docs) == {
                         "indexId": "handbook", "embeddingModel": "embed", "documentCount": 2, "chunkCount": 3,
@@ -171,31 +191,90 @@ def smoke(exe, output):
                     no_evidence = request(port, INDEX + "/answer", {**question, "question": "No matches"}, 422)
                     assert no_evidence["error"]["code"] == "no_context"
                     assert all(route != "/chat/v1/chat/completions" for route, _ in calls)
+                    expected_evidence, expected_answer = [best], ANSWER
                     answer = request(port, INDEX + "/answer", question, 200)
                     assert answer["answer"] == ANSWER and answer["model"] == "chat"
                     assert answer["id"].startswith("cmpl-") and answer["sources"] == [best]
+
+                    count = len(calls)
+                    assert upsert(port, docs[0], 401, key=None)["error"]["code"] == "unauthorized"
+                    assert delete(port, "planet", 401, key=None)["error"]["code"] == "unauthorized"
+                    assert upsert(port, {"id": "planet"}, 400)["error"]["code"] == "invalid_document"
+                    assert len(calls) == count
+
+                    backup = {"id": BACKUP_ID, "text": BACKUP_FACT, "source": "https://example.test/calendar"}
+                    extra = {"id": "almanac", "text": EXTRA_FACT}
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        additions = [pool.submit(upsert, port, doc) for doc in (backup, extra)]
+                        assert sorted(result.result()["documentCount"] for result in additions) == [3, 4]
+                    assert sorted(call[1]["input"] for call in calls[count:]) == sorted([[BACKUP_FACT], [EXTRA_FACT]])
+
+                    update = {"id": "planet", "text": UPDATED_FACT, "title": "Updated planet handbook",
+                              "source": "https://example.test/updated-planet"}
+                    count = len(calls)
+                    assert upsert(port, update) == {
+                        "indexId": "handbook", "embeddingModel": "embed", "documentCount": 4, "chunkCount": 4,
+                    }
+                    assert len(calls) == count + 1 and calls[-1][1]["input"] == [UPDATED_FACT]
+                    updated = request(port, INDEX + "/search", query, 200)["hits"]
+                    assert [hit["text"] for hit in updated] == [UPDATED_FACT, BACKUP_FACT, EXTRA_FACT]
+                    assert updated[0]["source"] == {
+                        "documentId": "planet", "chunkNumber": 1, "title": update["title"], "source": update["source"],
+                    }
+                    failed_update = upsert(port, {**update, "text": "fail-replacement"}, 502)
+                    assert failed_update["error"]["code"] == "provider_error"
+                    assert request(port, INDEX + "/search", query, 200)["hits"] == updated
+
+                    count = len(calls)
+                    assert delete(port, "planet")["documentCount"] == 3
+                    assert delete(port, "planet", 404)["error"]["code"] == "document_not_found"
+                    assert len(calls) == count
+
+                with start("document-mutations") as port:
+                    remaining = request(port, INDEX + "/search", query, 200)["hits"]
+                    assert [hit["source"]["documentId"] for hit in remaining] == [BACKUP_ID, "almanac"]
+                    assert [hit["text"] for hit in remaining] == [BACKUP_FACT, EXTRA_FACT]
+                    expected_evidence = remaining
+                    expected_answer = "The calendar records an orbital period of 53 days [1]."
+                    after_delete = request(port, INDEX + "/answer", {**question, "topK": 2}, 200)
+                    assert after_delete["sources"] == remaining and after_delete["answer"] == expected_answer
 
                 write_models("different-upstream-model")
                 with start("model-changed") as port:
                     count = len(calls)
                     changed = request(port, INDEX + "/search", query, 409)
                     assert changed["error"]["code"] == "embedding_model_changed"
+                    assert upsert(port, docs[0], 409)["error"]["code"] == "embedding_model_changed"
+                    assert delete(port, BACKUP_ID)["documentCount"] == 2
+                    assert delete(port, "almanac")["documentCount"] == 1
+                    assert delete(port, "accounting")["chunkCount"] == 0
+                    assert request(port, INDEX + "/search", query, 200)["hits"] == []
+                    assert request(port, INDEX + "/answer", question, 422)["error"]["code"] == "no_context"
                     assert len(calls) == count
 
                 entries = audit_entries(audit)
                 execution = [row for row in entries if row["EventType"] == "inference.execution"]
-                retrieval, completion = execution[-2:]
+                completion = next(row for row in execution if row["Metadata"].get("completion_id") == after_delete["id"])
+                retrieval = next(row for row in execution
+                                 if row["Metadata"]["request_id"] == completion["Metadata"]["request_id"]
+                                 and row["Metadata"]["operation"] == "rag.answer.retrieve")
+                assert sum(row["Description"] == "succeeded" and row["Metadata"]["operation"] == "rag.document.upsert"
+                           for row in execution) == 3
                 assert retrieval["Description"] == completion["Description"] == "succeeded"
                 assert retrieval["Metadata"]["operation"] == "rag.answer.retrieve"
                 assert completion["Metadata"]["operation"] == "rag.answer"
                 assert retrieval["Metadata"]["request_id"] == completion["Metadata"]["request_id"]
-                assert completion["Metadata"]["completion_id"] == answer["id"]
+                assert completion["Metadata"]["completion_id"] == after_delete["id"]
 
                 citations = [{key: hit[key] for key in ("citation", "source", "score")}
                              for hit in expected_search["hits"]]
                 result = {"sha256": digest, "machine": "win-x64", "ranked_citations": citations,
                           "answer": answer["answer"], "survived_restart_and_failed_replacement": True,
                           "changed_embedding_model_rejected": True, "no_context_rejected": True,
+                          "concurrent_additions_preserved": True, "updated_search_text": updated[0]["text"],
+                          "failed_update_preserved_document": True, "empty_index_returns_no_hits": True,
+                          "search_documents_after_delete": [hit["source"]["documentId"] for hit in remaining],
+                          "answer_after_delete": after_delete["answer"],
                           "upstream_calls": len(calls), "audit_records": len(entries)}
                 (output / "rag-result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
                 print(json.dumps(result, indent=2))
