@@ -1,68 +1,111 @@
-using AIKernel.Monolith.Hosting;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using AIKernel.Dtos.Governance;
+using AIKernel.Enums.Governance;
+using AIKernel.Monolith.Hosting;
+using AIKernel.Monolith.Internal;
+using AIKernel.Providers.ChatOpenAI;
 
 namespace AIKernel.Monolith.Models;
 
 /// <summary>
-/// EN: Registry for model providers and external model metadata. JA: model provider と外部 model metadata の registry です。
+/// Loads executable model registrations from the external model mount.
 /// </summary>
 public sealed class ModelProviderRegistry
 {
-    private readonly MountOptions mountOptions;
-    private readonly IEnumerable<IModelProvider> providers;
+    private const string ChatOpenAIProviderId = "providers.openai";
+    private readonly Dictionary<string, RegisteredModel> models = new(StringComparer.Ordinal);
 
-    /// <summary>
-    /// EN: Creates a model registry. JA: model registry を作成します。
-    /// </summary>
-    public ModelProviderRegistry(MountOptions mountOptions, IEnumerable<IModelProvider> providers)
+    public ModelProviderRegistry(MountOptions mountOptions)
     {
-        this.mountOptions = mountOptions;
-        this.providers = providers;
-    }
-
-    /// <summary>
-    /// EN: Lists mounted models in deterministic order. JA: マウント済みモデルを決定論的順序で列挙します。
-    /// </summary>
-    public IReadOnlyList<ModelMetadata> ListModels()
-    {
-        var fromProviders = providers.SelectMany(x => x.ListModels());
-        var fromFiles = Directory.EnumerateFiles(mountOptions.ModelRoot, "*.json", SearchOption.AllDirectories)
-            .Order(StringComparer.Ordinal)
-            .SelectMany(ReadModels);
-        return fromProviders.Concat(fromFiles)
-            .OrderBy(x => x.Id, StringComparer.Ordinal)
-            .ThenBy(x => x.Provider, StringComparer.Ordinal)
-            .ToArray();
-    }
-
-    /// <summary>
-    /// EN: Completes text using the first deterministic provider. JA: 最初の決定論的 provider でテキストを completion します。
-    /// </summary>
-    public ModelCompletion Complete(ModelCompletionRequest request)
-        => providers.OrderBy(x => x.Id, StringComparer.Ordinal).First().Complete(request);
-
-    private static IEnumerable<ModelMetadata> ReadModels(string path)
-    {
-        using var document = JsonDocument.Parse(File.ReadAllText(path));
-        var root = document.RootElement;
-        if (root.ValueKind == JsonValueKind.Array)
+        foreach (var path in Directory.EnumerateFiles(mountOptions.ModelRoot, "*.json", SearchOption.AllDirectories)
+                     .Order(StringComparer.Ordinal))
         {
-            foreach (var item in root.EnumerateArray())
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            var root = document.RootElement;
+            var registrations = root.ValueKind == JsonValueKind.Array
+                ? root.Deserialize(InferenceJsonContext.Default.ModelRegistrationArray)
+                : [root.Deserialize(InferenceJsonContext.Default.ModelRegistration)];
+
+            foreach (var registration in registrations ?? [])
             {
-                yield return ReadModel(item);
+                if (registration?.Provider != ChatOpenAIProviderId)
+                {
+                    continue;
+                }
+
+                var model = CreateModel(registration, path);
+                if (!models.TryAdd(model.Metadata.Id, model))
+                {
+                    throw new InvalidDataException($"Duplicate model ID '{model.Metadata.Id}' in '{path}'.");
+                }
             }
         }
-        else
-        {
-            yield return ReadModel(root);
-        }
     }
 
-    private static ModelMetadata ReadModel(JsonElement item)
+    /// <summary>Lists registered models in ordinal ID order.</summary>
+    public IReadOnlyList<ModelMetadata> ListModels()
+        => models.Values.Select(x => x.Metadata).OrderBy(x => x.Id, StringComparer.Ordinal).ToArray();
+
+    internal RegisteredModel? Find(string id) => models.GetValueOrDefault(id);
+
+    private static RegisteredModel CreateModel(ModelRegistration registration, string path)
     {
-        var id = item.TryGetProperty("id", out var idValue) ? idValue.GetString() ?? "unknown" : "unknown";
-        var provider = item.TryGetProperty("provider", out var providerValue) ? providerValue.GetString() ?? "external" : "external";
-        var kind = item.TryGetProperty("kind", out var kindValue) ? kindValue.GetString() ?? "chat" : "chat";
-        return new ModelMetadata(id, provider, kind);
+        if (string.IsNullOrWhiteSpace(registration.Id) ||
+            registration.Kind is not (null or "chat") ||
+            !Uri.TryCreate(registration.Endpoint, UriKind.Absolute, out var endpoint) ||
+            endpoint.Scheme is not ("http" or "https") ||
+            endpoint.UserInfo.Length != 0 || endpoint.Query.Length != 0 || endpoint.Fragment.Length != 0 ||
+            (registration.ApiKeyEnvironmentVariable is not null &&
+                (string.IsNullOrWhiteSpace(registration.ApiKeyEnvironmentVariable) || endpoint.Scheme != "https")) ||
+            (registration.Model is not null && string.IsNullOrWhiteSpace(registration.Model)))
+        {
+            throw new InvalidDataException($"Invalid ChatOpenAI model registration in '{path}'.");
+        }
+
+        var settings = new ChatOpenAISettings
+        {
+            Endpoint = new UriBuilder(endpoint) { Path = endpoint.AbsolutePath.TrimEnd('/') + "/" }.Uri,
+            Model = registration.Model ?? registration.Id
+        };
+
+        return new RegisteredModel(
+            new ModelMetadata(registration.Id, ChatOpenAIProviderId, "chat"),
+            settings,
+            registration.ApiKeyEnvironmentVariable,
+            new GateInput
+            {
+                Logos = ParseVote(registration.Policy?.Logos),
+                Ethos = ParseVote(registration.Policy?.Ethos),
+                Pathos = ParseVote(registration.Policy?.Pathos)
+            });
     }
+
+    private static CouncilVoteValue ParseVote(string? vote) => vote switch
+    {
+        "approve" => CouncilVoteValue.Approve,
+        "abstain" => CouncilVoteValue.Abstain,
+        "reject" => CouncilVoteValue.Reject,
+        _ => CouncilVoteValue.Unknown
+    };
 }
+
+internal sealed record RegisteredModel(
+    ModelMetadata Metadata,
+    ChatOpenAISettings Settings,
+    string? ApiKeyEnvironmentVariable,
+    GateInput Policy);
+
+internal sealed record ModelRegistration(
+    [property: JsonPropertyName("id")] string? Id,
+    [property: JsonPropertyName("provider")] string? Provider,
+    [property: JsonPropertyName("kind")] string? Kind,
+    [property: JsonPropertyName("endpoint")] string? Endpoint,
+    [property: JsonPropertyName("model")] string? Model,
+    [property: JsonPropertyName("apiKeyEnvironmentVariable")] string? ApiKeyEnvironmentVariable,
+    [property: JsonPropertyName("policy")] ModelPolicy? Policy);
+
+internal sealed record ModelPolicy(
+    [property: JsonPropertyName("logos")] string? Logos,
+    [property: JsonPropertyName("ethos")] string? Ethos,
+    [property: JsonPropertyName("pathos")] string? Pathos);

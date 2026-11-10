@@ -1,7 +1,15 @@
 [
   {
-    "id": "null-model",
-    "provider": "null",
-    "kind": "chat"
+    "id": "openai-chat",
+    "provider": "providers.openai",
+    "kind": "chat",
+    "endpoint": "https://api.openai.com/v1/",
+    "model": "gpt-4.1-mini",
+    "apiKeyEnvironmentVariable": "OPENAI_API_KEY",
+    "policy": {
+      "logos": "approve",
+      "ethos": "approve",
+      "pathos": "abstain"
+    }
   }
 ]

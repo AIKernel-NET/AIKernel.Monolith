@@ -1,9 +1,11 @@
-FROM mcr.microsoft.com/dotnet/sdk:10.0-preview AS build
-WORKDIR /src
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src/AIKernel.Monolith
 COPY . .
+COPY --from=aikernel-providers Directory.Build.props /src/AIKernel.Providers/
+COPY --from=aikernel-providers src/Chat/ChatOpenAIProvider/*.cs src/Chat/ChatOpenAIProvider/*.csproj src/Chat/ChatOpenAIProvider/openai.provider.json /src/AIKernel.Providers/src/Chat/ChatOpenAIProvider/
 RUN dotnet publish src/AIKernel.Monolith/AIKernel.Monolith.csproj -c Release -r linux-x64 --self-contained true -o /out /p:PublishAot=true
 
-FROM mcr.microsoft.com/dotnet/runtime-deps:10.0-preview
+FROM mcr.microsoft.com/dotnet/runtime-deps:10.0
 WORKDIR /aikernel
 COPY --from=build /out/ ./
 COPY samples/ /aikernel/samples/

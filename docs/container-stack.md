@@ -25,11 +25,11 @@ The base image contains only the AOT binary, entrypoint, and read-only samples.
 
 ## External Mount Architecture
 
-Runtime data must be mounted externally. Missing mounts cause startup failure.
+Runtime data must be mounted externally. Missing mounts cause startup failure. The runtime writes inference audit events to the external config mount.
 
 ## Container Stack Architecture
 
-- `Dockerfile.base`: AOT binary and samples.
+- `Dockerfile.base`: AOT binary and samples. Pass the sibling AIKernel.Providers checkout as the `aikernel-providers` build context.
 - `Dockerfile.linux`: Linux native ABI layer.
 - `Dockerfile.windows`: Windows native ABI layer.
 

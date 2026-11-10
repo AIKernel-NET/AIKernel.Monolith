@@ -17,7 +17,7 @@ docs/                        Architecture and operating guides
 
 ## Run the Monolith
 
-The runtime requires four external mount roots. It does not create or modify persistent user files inside the container.
+The runtime requires four external mount roots. Inference audit events are appended to the external config mount.
 
 ```bash
 dotnet run --project src/AIKernel.Monolith/AIKernel.Monolith.csproj -- \
@@ -56,17 +56,37 @@ The Minimal API exposes:
 - `GET /v1/models`
 - `GET /health`
 
-The initial provider is `NullModelProvider`, a deterministic placeholder used until real model drivers are mounted.
+Register a chat model by copying [the sample](samples/sample-models.json) under the
+model mount and setting its upstream model, endpoint, and policy. Restart the
+host to load changes to model registrations. The API uses
+`id` for exact selection and `model` for the upstream model name. Set the
+environment variable named by `apiKeyEnvironmentVariable` in the host or pass
+it into the container. Omit the field for an endpoint that needs no key. The
+runtime sends API keys only over HTTPS.
+
+The Core CTG decision gate evaluates the operator-supplied `logos`, `ethos`,
+and `pathos` votes before each chat or text completion. Missing or unrecognized
+votes deny execution. An Ethos rejection vetoes execution even when the other
+two votes approve. Unknown model IDs return 404 and policy denials return 403.
+
+The host appends decisions and execution outcomes to `/config/inference-audit.jsonl`.
+The config mount must be writable by the host. Restrict writes to the model
+mount to operators and use a separate config mount per instance. Audit events
+include the request ID, model and provider IDs, and the outcome.
+
+The embeddings route returns an unsupported-operation error for registered
+chat models.
 
 ## Container Stack
 
 ```bash
-docker build -f docker/Dockerfile.base -t aikernel/monolith:base .
+docker build --build-context aikernel-providers=../AIKernel.Providers -f docker/Dockerfile.base -t aikernel/monolith:base .
 docker build -f docker/Dockerfile.linux -t aikernel/monolith:linux .
 docker build -f docker/Dockerfile.windows -t aikernel/monolith:windows .
 ```
 
 The base image contains the AOT-compiled monolith binary, entrypoint, and sample configuration. Linux and Windows images extend it with platform-specific native ABI layers.
+The native build uses the sibling AIKernel.Providers checkout for the AOT-safe ChatOpenAI client. A standalone Monolith checkout uses the published Provider package and runs as a managed .NET app.
 
 Run with explicit mounts:
 
@@ -80,6 +100,7 @@ docker run --rm -p 8080:8080 \
   -e AIKERNEL_MODEL_ROOT=/models \
   -e AIKERNEL_VFS_ROOT=/vfs \
   -e AIKERNEL_CAPABILITY_ROOT=/capabilities \
+  -e OPENAI_API_KEY \
   aikernel/monolith:linux
 ```
 
@@ -88,14 +109,14 @@ docker run --rm -p 8080:8080 \
 The `aikernel-monolith` package provides the `aikernel` command.
 
 ```bash
-pip install aikernel-monolith==0.1.1
+pip install ./python
 aikernel init
 aikernel up
 aikernel status
 aikernel stop
 ```
 
-`aikernel up` creates and mounts:
+`aikernel up` forwards `OPENAI_API_KEY` from the host and creates and mounts:
 
 - `~/.aikernel/config`
 - `~/.aikernel/models`
@@ -106,7 +127,6 @@ aikernel stop
 
 - Capability scanning uses ordinal ordering.
 - Model metadata is listed by stable id/provider order.
-- User files are never auto-created by the container runtime.
 - Persistent data belongs only in external mounts.
 - Missing mount roots fail closed.
 

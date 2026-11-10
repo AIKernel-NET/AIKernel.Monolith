@@ -49,6 +49,8 @@ def run_container(detach: bool = True) -> subprocess.CompletedProcess[str]:
         "AIKERNEL_VFS_ROOT=/vfs",
         "-e",
         "AIKERNEL_CAPABILITY_ROOT=/capabilities",
+        "-e",
+        "OPENAI_API_KEY",
     ]
     if detach:
         command.append("-d")

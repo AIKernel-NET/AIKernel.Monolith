@@ -1,4 +1,8 @@
+using AIKernel.Abstractions.Events;
+using AIKernel.Abstractions.Governance;
+using AIKernel.Core.Governance;
 using AIKernel.Monolith.Capabilities;
+using AIKernel.Monolith.Internal;
 using AIKernel.Monolith.Models;
 using AIKernel.Monolith.Routing;
 using AIKernel.Monolith.VFS;
@@ -24,7 +28,13 @@ public static class MonolithServiceCollectionExtensions
         services.AddSingleton<ICapabilityInvokerBinder, CapabilityInvokerBinder>();
         services.AddSingleton<CapabilityLoader>();
         services.AddSingleton<ModelProviderRegistry>();
-        services.AddSingleton<IModelProvider, NullModelProvider>();
+        services.AddSingleton<IDecisionGate>(_ => new CtgDecisionGateEvaluator());
+        services.AddSingleton<IAuditEventWriter, FileInferenceAuditWriter>();
+        services.AddSingleton<GovernedModelInference>();
+        services.AddHttpClient(GovernedModelInference.HttpClientName)
+            .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
+        services.ConfigureHttpJsonOptions(options =>
+            options.SerializerOptions.TypeInfoResolverChain.Insert(0, MonolithJsonContext.Default));
         services.AddSingleton<Routing.IRouter, DeterministicRouter>();
         services.AddSingleton<RouteTable>();
         services.AddSingleton<SemanticRouteResolver>();

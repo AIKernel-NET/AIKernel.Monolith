@@ -14,7 +14,7 @@ public sealed record ChatCompletionRequest(
 /// </summary>
 public sealed record ChatMessage(
     [property: JsonPropertyName("role")] string Role,
-    [property: JsonPropertyName("content")] string Content);
+    [property: JsonPropertyName("content")] string Content) : AIKernel.Abstractions.Providers.IModelMessage;
 
 /// <summary>
 /// EN: OpenAI-compatible completion request. JA: OpenAI 互換 completion request です。
@@ -99,3 +99,10 @@ public sealed record EmbeddingData(
     [property: JsonPropertyName("object")] string Object,
     [property: JsonPropertyName("index")] int Index,
     [property: JsonPropertyName("embedding")] IReadOnlyList<float> Embedding);
+
+internal sealed record OpenAIErrorResponse(
+    [property: JsonPropertyName("error")] OpenAIError Error);
+
+internal sealed record OpenAIError(
+    [property: JsonPropertyName("message")] string Message,
+    [property: JsonPropertyName("code")] string Code);

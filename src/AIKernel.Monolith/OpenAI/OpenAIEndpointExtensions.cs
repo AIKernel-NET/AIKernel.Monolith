@@ -1,5 +1,5 @@
-using AIKernel.Monolith.Models;
 using AIKernel.Monolith.Internal;
+using AIKernel.Monolith.Models;
 
 namespace AIKernel.Monolith.OpenAI;
 
@@ -19,31 +19,50 @@ public static class OpenAIEndpointExtensions
                 registry.ListModels().Select(x => new ModelObject(x.Id, "model", x.Provider)).ToArray()),
             MonolithJsonContext.Default.ModelsResponse));
 
-        endpoints.MapPost("/v1/completions", (CompletionRequest request, ModelProviderRegistry registry) =>
+        endpoints.MapPost("/v1/completions", async (CompletionRequest request, HttpContext context,
+            GovernedModelInference inference, CancellationToken cancellationToken) =>
         {
-            var completion = registry.Complete(new ModelCompletionRequest(request.Model, request.Prompt));
+            var outcome = await inference.CompleteAsync(request.Model,
+                string.IsNullOrWhiteSpace(request.Prompt) ? null : [new ChatMessage("user", request.Prompt)],
+                context.TraceIdentifier, "completions", cancellationToken);
+            if (outcome.Error is { } error)
+            {
+                return ErrorResponse(error);
+            }
+
+            var completion = outcome.Completion!;
             return Results.Json(
                 new CompletionResponse(completion.Id, "text_completion", [new CompletionChoice(completion.Text, 0, "stop")]),
                 MonolithJsonContext.Default.CompletionResponse);
         });
 
-        endpoints.MapPost("/v1/chat/completions", (ChatCompletionRequest request, ModelProviderRegistry registry) =>
+        endpoints.MapPost("/v1/chat/completions", async (ChatCompletionRequest request, HttpContext context,
+            GovernedModelInference inference, CancellationToken cancellationToken) =>
         {
-            var prompt = string.Join("\n", request.Messages.Select(x => $"{x.Role}: {x.Content}"));
-            var completion = registry.Complete(new ModelCompletionRequest(request.Model, prompt));
+            var outcome = await inference.CompleteAsync(request.Model, request.Messages,
+                context.TraceIdentifier, "chat.completions", cancellationToken);
+            if (outcome.Error is { } error)
+            {
+                return ErrorResponse(error);
+            }
+
+            var completion = outcome.Completion!;
             return Results.Json(
                 new ChatCompletionResponse(completion.Id, "chat.completion", [new ChatChoice(0, new ChatResponseMessage("assistant", completion.Text), "stop")]),
                 MonolithJsonContext.Default.ChatCompletionResponse);
         });
 
-        endpoints.MapPost("/v1/embeddings", (EmbeddingRequest request) =>
-        {
-            var vector = request.Input.Select(ch => (float)(ch % 23) / 23f).Take(16).ToArray();
-            return Results.Json(
-                new EmbeddingResponse("list", [new EmbeddingData("embedding", 0, vector)], request.Model),
-                MonolithJsonContext.Default.EmbeddingResponse);
-        });
+        endpoints.MapPost("/v1/embeddings", (EmbeddingRequest request, ModelProviderRegistry registry) =>
+            ErrorResponse(string.IsNullOrWhiteSpace(request.Model)
+                ? InferenceErrors.InvalidRequest
+                : registry.Find(request.Model) is null ? InferenceErrors.ModelNotFound : InferenceErrors.EmbeddingsUnsupported));
 
         return endpoints;
     }
+
+    private static IResult ErrorResponse(InferenceError error)
+        => Results.Json(
+            new OpenAIErrorResponse(new OpenAIError(error.Message, error.Code)),
+            InferenceJsonContext.Default.OpenAIErrorResponse,
+            statusCode: error.Status);
 }
