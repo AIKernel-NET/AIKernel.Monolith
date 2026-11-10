@@ -56,6 +56,31 @@ The Minimal API exposes:
 - `GET /v1/models`
 - `GET /health`
 
+### API Access
+
+Set `AIKERNEL_API_KEY` to a private, randomly generated bearer token before
+starting Monolith. Use a separate `OPENAI_API_KEY` for the upstream Provider.
+Monolith requires `Authorization: Bearer <token>` on requests, including
+`/health`. Missing or incorrect tokens receive `401` and a
+`WWW-Authenticate: Bearer` challenge. Use HTTPS for remote API clients.
+
+The request budget is shared by authenticated callers on each Monolith
+instance. It uses a fixed window and defaults to **60 requests per 60 seconds**.
+Set `AIKERNEL_API_REQUEST_LIMIT` and `AIKERNEL_API_WINDOW_SECONDS` to positive
+integers to change the budget. Each authenticated HTTP request consumes one
+permit, including streaming requests and diagnostic calls. Once the limit is
+reached, the host responds immediately with `429` and `Retry-After`. Failed
+authentication does not consume a permit. Restart Monolith to apply changes to
+the token or budget.
+
+For example, with the token already configured in your shell:
+
+```bash
+curl -H "Authorization: Bearer $AIKERNEL_API_KEY" http://127.0.0.1:8080/v1/models
+```
+
+### Model Registration
+
 Register a model by copying [the sample](samples/sample-models.json) under the
 model mount and setting its upstream model, endpoint, and policy. Restart the
 host to load changes to model registrations. The API uses
@@ -107,6 +132,9 @@ docker run --rm -p 8080:8080 \
   -e AIKERNEL_MODEL_ROOT=/models \
   -e AIKERNEL_VFS_ROOT=/vfs \
   -e AIKERNEL_CAPABILITY_ROOT=/capabilities \
+  -e AIKERNEL_API_KEY \
+  -e AIKERNEL_API_REQUEST_LIMIT \
+  -e AIKERNEL_API_WINDOW_SECONDS \
   -e OPENAI_API_KEY \
   aikernel/monolith:linux
 ```
@@ -115,6 +143,7 @@ To verify a published Windows x64 Native AOT executable against a loopback Provi
 
 ```powershell
 python tests/native-aot-stream-embeddings.py <published-exe> <report-directory>
+python tests/native-aot-api-access.py <published-exe> <report-directory>
 ```
 
 ## Python CLI
@@ -129,7 +158,8 @@ aikernel status
 aikernel stop
 ```
 
-`aikernel up` forwards `OPENAI_API_KEY` from the host and creates and mounts:
+`aikernel up` forwards `AIKERNEL_API_KEY`, the two request budget settings, and
+`OPENAI_API_KEY` from the host. It creates and mounts:
 
 - `~/.aikernel/config`
 - `~/.aikernel/models`

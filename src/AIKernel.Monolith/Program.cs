@@ -23,11 +23,19 @@ if (!validation.IsValid)
     return 2;
 }
 
+using var apiAccess = ApiRequestGate.FromEnvironment(Environment.GetEnvironmentVariable, out var accessError);
+if (apiAccess is null)
+{
+    Console.Error.WriteLine(accessError);
+    return 2;
+}
+
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddAIKernelMonolith(mountOptions);
 
 var app = builder.Build();
 _ = app.Services.GetRequiredService<ModelProviderRegistry>();
+app.Use(apiAccess.InvokeAsync);
 
 app.MapGet("/", (SemanticRuntime runtime) => Results.Json(runtime.Describe(), MonolithJsonContext.Default.RuntimeDescription));
 app.MapGet("/health", (SemanticRuntime runtime) => Results.Json(new HealthResponse("ok", runtime.Describe()), MonolithJsonContext.Default.HealthResponse));

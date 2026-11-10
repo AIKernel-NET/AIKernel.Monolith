@@ -39,6 +39,10 @@ Linux hosts use `aikernel/monolith:linux`; Windows hosts use `aikernel/monolith:
 
 ## Python CLI Workflow
 
+Set a private `AIKERNEL_API_KEY` in the host environment before `aikernel up`.
+The CLI also forwards optional `AIKERNEL_API_REQUEST_LIMIT` and
+`AIKERNEL_API_WINDOW_SECONDS` settings. API requests use the key as a bearer token.
+
 ```bash
 aikernel init
 aikernel up

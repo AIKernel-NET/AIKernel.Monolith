@@ -16,6 +16,9 @@ import threading
 import time
 
 
+TEST_API_KEY = "native-stream-test-only-key"
+
+
 def events(response):
     """Read data-only SSE events, one at a time."""
     while line := response.readline():
@@ -56,7 +59,7 @@ def wait_for_port(process, log):
 
 def request(port, route, payload):
     connection = HTTPConnection("127.0.0.1", port, timeout=15)
-    connection.request("POST", route, json.dumps(payload), {"Content-Type": "application/json"})
+    connection.request("POST", route, json.dumps(payload), {"Content-Type": "application/json", "Authorization": f"Bearer {TEST_API_KEY}"})
     return connection
 
 
@@ -176,6 +179,8 @@ def smoke(exe, output, capability_exe=None):
             env = {key: value for key, value in os.environ.items()
                    if key.lower() not in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
             env.update({"ASPNETCORE_ENVIRONMENT": "Production", "DOTNET_ENVIRONMENT": "Production",
+                        "AIKERNEL_API_KEY": TEST_API_KEY, "AIKERNEL_API_REQUEST_LIMIT": "1000",
+                        "AIKERNEL_API_WINDOW_SECONDS": "60",
                         "NO_PROXY": "127.0.0.1,localhost", "Logging__LogLevel__Microsoft.Hosting.Lifetime": "Information"})
             with log_path.open("wb") as log:
                 process = subprocess.Popen([str(binary), "--urls=http://127.0.0.1:0",

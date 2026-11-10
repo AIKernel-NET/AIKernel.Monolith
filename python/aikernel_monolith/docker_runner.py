@@ -50,6 +50,12 @@ def run_container(detach: bool = True) -> subprocess.CompletedProcess[str]:
         "-e",
         "AIKERNEL_CAPABILITY_ROOT=/capabilities",
         "-e",
+        "AIKERNEL_API_KEY",
+        "-e",
+        "AIKERNEL_API_REQUEST_LIMIT",
+        "-e",
+        "AIKERNEL_API_WINDOW_SECONDS",
+        "-e",
         "OPENAI_API_KEY",
     ]
     if detach:
