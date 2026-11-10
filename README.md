@@ -56,7 +56,7 @@ The Minimal API exposes:
 - `GET /v1/models`
 - `GET /health`
 
-Register a chat model by copying [the sample](samples/sample-models.json) under the
+Register a model by copying [the sample](samples/sample-models.json) under the
 model mount and setting its upstream model, endpoint, and policy. Restart the
 host to load changes to model registrations. The API uses
 `id` for exact selection and `model` for the upstream model name. Set the
@@ -65,7 +65,7 @@ it into the container. Omit the field for an endpoint that needs no key. The
 runtime sends API keys only over HTTPS.
 
 The Core CTG decision gate evaluates the operator-supplied `logos`, `ethos`,
-and `pathos` votes before each chat or text completion. Missing or unrecognized
+and `pathos` votes before each completion or embedding request. Missing or unrecognized
 votes deny execution. An Ethos rejection vetoes execution even when the other
 two votes approve. Unknown model IDs return 404 and policy denials return 403.
 
@@ -74,8 +74,15 @@ The config mount must be writable by the host. Restrict writes to the model
 mount to operators and use a separate config mount per instance. Audit events
 include the request ID, model and provider IDs, and the outcome.
 
-The embeddings route returns an unsupported-operation error for registered
-chat models.
+Set `stream: true` on chat or text completions to receive Server-Sent Events.
+The host flushes each text delta as it arrives and sends `[DONE]` after a
+successful upstream finish. If a stream fails after output has started, it ends
+with an error event and no `[DONE]`.
+
+Register an embedding model with `kind: "embedding"` and its upstream model ID.
+`POST /v1/embeddings` accepts one string or an array of non-empty strings and
+returns floating-point vectors in input order. A chat registration only accepts
+completion requests, and an embedding registration only accepts embedding requests.
 
 ## Container Stack
 
@@ -86,7 +93,7 @@ docker build -f docker/Dockerfile.windows -t aikernel/monolith:windows .
 ```
 
 The base image contains the AOT-compiled monolith binary, entrypoint, and sample configuration. Linux and Windows images extend it with platform-specific native ABI layers.
-The native build uses the sibling AIKernel.Providers checkout for the AOT-safe ChatOpenAI client. A standalone Monolith checkout uses the published Provider package and runs as a managed .NET app.
+The native build uses the sibling AIKernel.Providers checkout for the AOT-safe ChatOpenAI client. For a checkout without the Provider sources, set `ChatOpenAIProviderPackageVersion` to a package version that includes the streaming and embedding APIs.
 
 Run with explicit mounts:
 
@@ -102,6 +109,12 @@ docker run --rm -p 8080:8080 \
   -e AIKERNEL_CAPABILITY_ROOT=/capabilities \
   -e OPENAI_API_KEY \
   aikernel/monolith:linux
+```
+
+To verify a published Windows x64 Native AOT executable against a loopback Provider:
+
+```powershell
+python tests/native-aot-stream-embeddings.py <published-exe> <report-directory>
 ```
 
 ## Python CLI

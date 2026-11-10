@@ -22,15 +22,21 @@ public static class OpenAIEndpointExtensions
         endpoints.MapPost("/v1/completions", async (CompletionRequest request, HttpContext context,
             GovernedModelInference inference, CancellationToken cancellationToken) =>
         {
-            var outcome = await inference.CompleteAsync(request.Model,
-                string.IsNullOrWhiteSpace(request.Prompt) ? null : [new ChatMessage("user", request.Prompt)],
+            IReadOnlyList<ChatMessage>? messages = string.IsNullOrWhiteSpace(request.Prompt)
+                ? null : [new ChatMessage("user", request.Prompt)];
+            if (request.Stream == true)
+            {
+                return await StreamAsync(request.Model, messages, context, inference, "completions", chat: false, cancellationToken);
+            }
+
+            var outcome = await inference.CompleteAsync(request.Model, messages,
                 context.TraceIdentifier, "completions", cancellationToken);
             if (outcome.Error is { } error)
             {
                 return ErrorResponse(error);
             }
 
-            var completion = outcome.Completion!;
+            var completion = outcome.Value!;
             return Results.Json(
                 new CompletionResponse(completion.Id, "text_completion", [new CompletionChoice(completion.Text, 0, "stop")]),
                 MonolithJsonContext.Default.CompletionResponse);
@@ -39,6 +45,12 @@ public static class OpenAIEndpointExtensions
         endpoints.MapPost("/v1/chat/completions", async (ChatCompletionRequest request, HttpContext context,
             GovernedModelInference inference, CancellationToken cancellationToken) =>
         {
+            if (request.Stream == true)
+            {
+                return await StreamAsync(request.Model, request.Messages, context, inference,
+                    "chat.completions", chat: true, cancellationToken);
+            }
+
             var outcome = await inference.CompleteAsync(request.Model, request.Messages,
                 context.TraceIdentifier, "chat.completions", cancellationToken);
             if (outcome.Error is { } error)
@@ -46,18 +58,54 @@ public static class OpenAIEndpointExtensions
                 return ErrorResponse(error);
             }
 
-            var completion = outcome.Completion!;
+            var completion = outcome.Value!;
             return Results.Json(
                 new ChatCompletionResponse(completion.Id, "chat.completion", [new ChatChoice(0, new ChatResponseMessage("assistant", completion.Text), "stop")]),
                 MonolithJsonContext.Default.ChatCompletionResponse);
         });
 
-        endpoints.MapPost("/v1/embeddings", (EmbeddingRequest request, ModelProviderRegistry registry) =>
-            ErrorResponse(string.IsNullOrWhiteSpace(request.Model)
-                ? InferenceErrors.InvalidRequest
-                : registry.Find(request.Model) is null ? InferenceErrors.ModelNotFound : InferenceErrors.EmbeddingsUnsupported));
+        endpoints.MapPost("/v1/embeddings", async (EmbeddingApiRequest request, HttpContext context,
+            GovernedModelInference inference, CancellationToken cancellationToken) =>
+        {
+            var outcome = await inference.EmbedAsync(request.Model, request.GetTexts(), context.TraceIdentifier, cancellationToken);
+            if (outcome.Error is { } error)
+            {
+                return ErrorResponse(error);
+            }
+
+            var data = outcome.Value!.Select((vector, index) => new EmbeddingData("embedding", index, vector)).ToArray();
+            return Results.Json(new EmbeddingResponse("list", data, request.Model),
+                MonolithJsonContext.Default.EmbeddingResponse);
+        });
 
         return endpoints;
+    }
+
+    private static async Task<IResult> StreamAsync(
+        string model,
+        IReadOnlyList<ChatMessage>? messages,
+        HttpContext context,
+        GovernedModelInference inference,
+        string operation,
+        bool chat,
+        CancellationToken cancellationToken)
+    {
+        var stream = new OpenAIStreamingResponse(context, model, chat, cancellationToken);
+        var outcome = await inference.StreamAsync(model, messages, context.TraceIdentifier, operation,
+            stream.Id, stream.WriteChunkAsync, cancellationToken);
+        if (outcome.Error is { } error)
+        {
+            if (!context.Response.HasStarted)
+            {
+                return ErrorResponse(error);
+            }
+
+            await stream.WriteErrorAsync(error);
+            return Results.Empty;
+        }
+
+        await stream.CompleteAsync(outcome.Value!);
+        return Results.Empty;
     }
 
     private static IResult ErrorResponse(InferenceError error)

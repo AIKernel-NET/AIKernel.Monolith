@@ -11,5 +11,18 @@
       "ethos": "approve",
       "pathos": "abstain"
     }
+  },
+  {
+    "id": "openai-embedding",
+    "provider": "providers.openai",
+    "kind": "embedding",
+    "endpoint": "https://api.openai.com/v1/",
+    "model": "text-embedding-3-small",
+    "apiKeyEnvironmentVariable": "OPENAI_API_KEY",
+    "policy": {
+      "logos": "approve",
+      "ethos": "approve",
+      "pathos": "abstain"
+    }
   }
 ]

@@ -34,7 +34,10 @@ public static class MonolithServiceCollectionExtensions
         services.AddHttpClient(GovernedModelInference.HttpClientName)
             .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
         services.ConfigureHttpJsonOptions(options =>
-            options.SerializerOptions.TypeInfoResolverChain.Insert(0, MonolithJsonContext.Default));
+        {
+            options.SerializerOptions.TypeInfoResolverChain.Insert(0, MonolithJsonContext.Default);
+            options.SerializerOptions.TypeInfoResolverChain.Insert(0, InferenceJsonContext.Default);
+        });
         services.AddSingleton<Routing.IRouter, DeterministicRouter>();
         services.AddSingleton<RouteTable>();
         services.AddSingleton<SemanticRouteResolver>();

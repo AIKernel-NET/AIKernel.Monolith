@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace AIKernel.Monolith.OpenAI;
@@ -7,7 +8,12 @@ namespace AIKernel.Monolith.OpenAI;
 /// </summary>
 public sealed record ChatCompletionRequest(
     [property: JsonPropertyName("model")] string Model,
-    [property: JsonPropertyName("messages")] IReadOnlyList<ChatMessage> Messages);
+    [property: JsonPropertyName("messages")] IReadOnlyList<ChatMessage> Messages)
+{
+    /// <summary>Gets whether to return an event stream.</summary>
+    [JsonPropertyName("stream")]
+    public bool? Stream { get; init; }
+}
 
 /// <summary>
 /// EN: OpenAI-compatible chat message. JA: OpenAI 互換 chat message です。
@@ -21,7 +27,12 @@ public sealed record ChatMessage(
 /// </summary>
 public sealed record CompletionRequest(
     [property: JsonPropertyName("model")] string Model,
-    [property: JsonPropertyName("prompt")] string Prompt);
+    [property: JsonPropertyName("prompt")] string Prompt)
+{
+    /// <summary>Gets whether to return an event stream.</summary>
+    [JsonPropertyName("stream")]
+    public bool? Stream { get; init; }
+}
 
 /// <summary>
 /// EN: OpenAI-compatible embedding request. JA: OpenAI 互換 embedding request です。
@@ -106,3 +117,67 @@ internal sealed record OpenAIErrorResponse(
 internal sealed record OpenAIError(
     [property: JsonPropertyName("message")] string Message,
     [property: JsonPropertyName("code")] string Code);
+
+internal sealed record EmbeddingApiRequest(
+    [property: JsonPropertyName("model")] string Model,
+    [property: JsonPropertyName("input")] JsonElement Input,
+    [property: JsonPropertyName("encoding_format")] string? EncodingFormat)
+{
+    internal IReadOnlyList<string>? GetTexts()
+    {
+        if (EncodingFormat is not (null or "float"))
+        {
+            return null;
+        }
+
+        if (Input.ValueKind == JsonValueKind.String)
+        {
+            var text = Input.GetString();
+            return string.IsNullOrWhiteSpace(text) ? null : [text];
+        }
+
+        if (Input.ValueKind != JsonValueKind.Array || Input.GetArrayLength() is 0 or > 2048)
+        {
+            return null;
+        }
+
+        var texts = new List<string>(Input.GetArrayLength());
+        foreach (var item in Input.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(item.GetString()))
+            {
+                return null;
+            }
+            texts.Add(item.GetString()!);
+        }
+        return texts;
+    }
+}
+
+internal sealed record ChatCompletionChunk(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("object")] string Object,
+    [property: JsonPropertyName("created")] long Created,
+    [property: JsonPropertyName("model")] string Model,
+    [property: JsonPropertyName("choices")] IReadOnlyList<ChatStreamChoice> Choices);
+
+internal sealed record ChatStreamChoice(
+    [property: JsonPropertyName("index")] int Index,
+    [property: JsonPropertyName("delta")] ChatStreamDelta Delta,
+    [property: JsonPropertyName("finish_reason")] string? FinishReason);
+
+internal sealed record ChatStreamDelta(
+    [property: JsonPropertyName("role"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Role,
+    [property: JsonPropertyName("content"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Content);
+
+internal sealed record TextCompletionChunk(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("object")] string Object,
+    [property: JsonPropertyName("created")] long Created,
+    [property: JsonPropertyName("model")] string Model,
+    [property: JsonPropertyName("choices")] IReadOnlyList<TextStreamChoice> Choices);
+
+internal sealed record TextStreamChoice(
+    [property: JsonPropertyName("text")] string Text,
+    [property: JsonPropertyName("index")] int Index,
+    [property: JsonPropertyName("finish_reason")] string? FinishReason);

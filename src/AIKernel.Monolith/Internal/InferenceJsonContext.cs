@@ -9,4 +9,7 @@ namespace AIKernel.Monolith.Internal;
 [JsonSerializable(typeof(ModelRegistration[]))]
 [JsonSerializable(typeof(AuditEvent))]
 [JsonSerializable(typeof(OpenAIErrorResponse))]
+[JsonSerializable(typeof(EmbeddingApiRequest))]
+[JsonSerializable(typeof(ChatCompletionChunk))]
+[JsonSerializable(typeof(TextCompletionChunk))]
 internal sealed partial class InferenceJsonContext : JsonSerializerContext;

@@ -52,7 +52,7 @@ public sealed class ModelProviderRegistry
     private static RegisteredModel CreateModel(ModelRegistration registration, string path)
     {
         if (string.IsNullOrWhiteSpace(registration.Id) ||
-            registration.Kind is not (null or "chat") ||
+            registration.Kind is not (null or "chat" or "embedding") ||
             !Uri.TryCreate(registration.Endpoint, UriKind.Absolute, out var endpoint) ||
             endpoint.Scheme is not ("http" or "https") ||
             endpoint.UserInfo.Length != 0 || endpoint.Query.Length != 0 || endpoint.Fragment.Length != 0 ||
@@ -63,14 +63,17 @@ public sealed class ModelProviderRegistry
             throw new InvalidDataException($"Invalid ChatOpenAI model registration in '{path}'.");
         }
 
+        var kind = registration.Kind ?? "chat";
+        var upstreamModel = registration.Model ?? registration.Id;
         var settings = new ChatOpenAISettings
         {
             Endpoint = new UriBuilder(endpoint) { Path = endpoint.AbsolutePath.TrimEnd('/') + "/" }.Uri,
-            Model = registration.Model ?? registration.Id
+            Model = upstreamModel,
+            EmbeddingModel = kind == "embedding" ? upstreamModel : null
         };
 
         return new RegisteredModel(
-            new ModelMetadata(registration.Id, ChatOpenAIProviderId, "chat"),
+            new ModelMetadata(registration.Id, ChatOpenAIProviderId, kind),
             settings,
             registration.ApiKeyEnvironmentVariable,
             new GateInput

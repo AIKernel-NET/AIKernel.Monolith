@@ -19,12 +19,62 @@ internal sealed class GovernedModelInference(
 {
     internal const string HttpClientName = "monolith-inference";
 
-    internal async Task<InferenceOutcome> CompleteAsync(
+    internal Task<InferenceOutcome<ModelCompletion>> CompleteAsync(
         string? modelId,
         IReadOnlyList<ChatMessage>? messages,
         string requestId,
         string operation,
         CancellationToken cancellationToken)
+    {
+        var id = CreateCompletionId();
+        return RunAsync<ModelCompletion>(modelId, requestId, operation, "chat",
+            ValidateMessages(messages), id, async (provider, token) =>
+            {
+                var text = await provider.GenerateAsync(messages!, token);
+                return string.IsNullOrEmpty(text) ? null : new ModelCompletion(id, text);
+            }, cancellationToken);
+    }
+
+    internal Task<InferenceOutcome<string>> StreamAsync(
+        string? modelId,
+        IReadOnlyList<ChatMessage>? messages,
+        string requestId,
+        string operation,
+        string completionId,
+        Func<string, Task> onChunk,
+        CancellationToken cancellationToken)
+        => RunAsync<string>(modelId, requestId, operation, "chat",
+            ValidateMessages(messages), completionId,
+            async (provider, token) => await provider.StreamCompletionAsync(messages!, onChunk, token),
+            cancellationToken);
+
+    internal Task<InferenceOutcome<IReadOnlyList<float[]>>> EmbedAsync(
+        string? modelId,
+        IReadOnlyList<string>? texts,
+        string requestId,
+        CancellationToken cancellationToken)
+        => RunAsync<IReadOnlyList<float[]>>(modelId, requestId, "embeddings", "embedding",
+            texts is null ? InferenceErrors.InvalidEmbeddingRequest : null, null,
+            async (provider, token) => await provider.EmbedBatchAsync(texts!, token),
+            cancellationToken);
+
+    internal static string CreateCompletionId() => $"cmpl-{Guid.CreateVersion7():N}";
+
+    private static InferenceError? ValidateMessages(IReadOnlyList<ChatMessage>? messages)
+        => messages is { Count: > 0 } && messages.All(message => message is
+            { Role: "system" or "developer" or "user" or "assistant", Content: not null })
+            ? null
+            : InferenceErrors.InvalidRequest;
+
+    private async Task<InferenceOutcome<T>> RunAsync<T>(
+        string? modelId,
+        string requestId,
+        string operation,
+        string requiredKind,
+        InferenceError? inputError,
+        string? completionId,
+        Func<ChatOpenAIProvider, CancellationToken, Task<T?>> execute,
+        CancellationToken cancellationToken) where T : class
     {
         var model = modelId is null ? null : registry.Find(modelId);
         var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -35,20 +85,20 @@ internal sealed class GovernedModelInference(
 
         if (model is null)
         {
-            var error = string.IsNullOrWhiteSpace(modelId) ? InferenceErrors.InvalidRequest : InferenceErrors.ModelNotFound;
-            return await RecordAsync("inference.rejected", error.Code, AuditSeverity.Warning)
-                ? new(Error: error)
-                : new(Error: InferenceErrors.AuditUnavailable);
+            return await RejectAsync(string.IsNullOrWhiteSpace(modelId)
+                ? InferenceErrors.InvalidRequest : InferenceErrors.ModelNotFound);
         }
 
         metadata["provider_id"] = model.Metadata.Provider;
-        if (messages is null || messages.Count == 0 ||
-            messages.Any(message => message is not
-                { Role: "system" or "developer" or "user" or "assistant", Content: not null }))
+        if (model.Metadata.Kind != requiredKind)
         {
-            return await RecordAsync("inference.rejected", InferenceErrors.InvalidRequest.Code, AuditSeverity.Warning)
-                ? new(Error: InferenceErrors.InvalidRequest)
-                : new(Error: InferenceErrors.AuditUnavailable);
+            return await RejectAsync(requiredKind == "embedding"
+                ? InferenceErrors.EmbeddingsUnsupported : InferenceErrors.ChatUnsupported);
+        }
+
+        if (inputError is not null)
+        {
+            return await RejectAsync(inputError);
         }
 
         var decision = await gate.EvaluateAsync(new DecisionGateRequest
@@ -75,6 +125,11 @@ internal sealed class GovernedModelInference(
             return new(Error: InferenceErrors.PolicyDenied);
         }
 
+        if (completionId is not null)
+        {
+            metadata["completion_id"] = completionId;
+        }
+
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -90,29 +145,35 @@ internal sealed class GovernedModelInference(
             using var httpClient = clients.CreateClient(HttpClientName);
             var provider = new ChatOpenAIProvider(settings, new ChatOpenAIClient(httpClient, settings));
             await provider.InitializeAsync();
-            var text = await provider.GenerateAsync(messages, cancellationToken);
-            if (string.IsNullOrEmpty(text))
+            var value = await execute(provider, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (value is null)
             {
                 return await ProviderFailedAsync("empty_provider_response");
             }
 
-            var completion = new ModelCompletion($"cmpl-{Guid.CreateVersion7():N}", text);
-            metadata["completion_id"] = completion.Id;
             return await RecordAsync("inference.execution", "succeeded", AuditSeverity.Information)
-                ? new(Completion: completion)
+                ? new(Value: value)
                 : new(Error: InferenceErrors.AuditUnavailable);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (ex is HttpRequestException or JsonException or InvalidDataException
+            or IOException or OperationCanceledException)
         {
-            await RecordAsync("inference.execution", "canceled", AuditSeverity.Warning);
-            throw;
-        }
-        catch (Exception ex) when (ex is HttpRequestException or JsonException or OperationCanceledException)
-        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                await RecordAsync("inference.execution", "canceled", AuditSeverity.Warning);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
             return await ProviderFailedAsync("provider_error");
         }
 
-        async Task<InferenceOutcome> ProviderFailedAsync(string reason)
+        async Task<InferenceOutcome<T>> RejectAsync(InferenceError error)
+            => await RecordAsync("inference.rejected", error.Code, AuditSeverity.Warning)
+                ? new(Error: error)
+                : new(Error: InferenceErrors.AuditUnavailable);
+
+        async Task<InferenceOutcome<T>> ProviderFailedAsync(string reason)
             => await RecordAsync("inference.execution", reason, AuditSeverity.Error)
                 ? new(Error: InferenceErrors.ProviderFailed)
                 : new(Error: InferenceErrors.AuditUnavailable);
@@ -135,13 +196,15 @@ internal sealed class GovernedModelInference(
     }
 }
 
-internal sealed record InferenceOutcome(ModelCompletion? Completion = null, InferenceError? Error = null);
+internal sealed record InferenceOutcome<T>(T? Value = null, InferenceError? Error = null) where T : class;
 internal sealed record InferenceError(int Status, string Code, string Message);
 
 internal static class InferenceErrors
 {
     internal static readonly InferenceError InvalidRequest =
         new(400, "invalid_request", "A model ID and valid text messages are required.");
+    internal static readonly InferenceError InvalidEmbeddingRequest =
+        new(400, "invalid_request", "Provide one to 2048 non-empty texts and use float encoding.");
     internal static readonly InferenceError ModelNotFound =
         new(404, "model_not_found", "The requested model is not registered.");
     internal static readonly InferenceError PolicyDenied =
@@ -152,4 +215,6 @@ internal static class InferenceErrors
         new(503, "audit_unavailable", "Inference audit storage is unavailable.");
     internal static readonly InferenceError EmbeddingsUnsupported =
         new(400, "unsupported_operation", "The requested model does not support embeddings.");
+    internal static readonly InferenceError ChatUnsupported =
+        new(400, "unsupported_operation", "The requested model does not support chat completions.");
 }
