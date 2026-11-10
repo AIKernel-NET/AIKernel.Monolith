@@ -109,6 +109,36 @@ Register an embedding model with `kind: "embedding"` and its upstream model ID.
 returns floating-point vectors in input order. A chat registration only accepts
 completion requests, and an embedding registration only accepts embedding requests.
 
+## Retrieval-Augmented Generation
+
+RAG uses registered embedding and chat models. The same Monolith bearer token,
+request budget, Core policy checks, and inference audit apply.
+
+| Method and route | JSON body | Result |
+| --- | --- | --- |
+| `PUT /v1/rag/indexes/{indexId}` | `{"embeddingModel":"embed","documents":[{"id":"handbook","title":"Handbook","source":"https://example.com/handbook","text":"The office closes at 18:00."}]}` | Index ID, embedding model ID, and document and chunk counts |
+| `POST /v1/rag/indexes/{indexId}/search` | `{"query":"When does the office close?","topK":3}` | Ranked hits with citation labels, source metadata, chunk text, and cosine scores |
+| `POST /v1/rag/indexes/{indexId}/answer` | `{"model":"chat","question":"When does the office close?","topK":3}` | Completion ID, chat model ID, answer text, and the source chunks supplied to the model |
+
+Use registered model IDs in place of `embed` and `chat`. Document IDs must
+be unique within an index. The `title` and `source` fields are optional
+metadata. Monolith indexes the supplied `text` directly. Each request
+accepts up to 64 documents and 256 chunks. Chunks are at most 1,000 UTF-16
+code units long and carry their document ID and one-based chunk number.
+
+Index IDs use up to 64 lowercase ASCII letters, digits, hyphens, or underscores.
+Indexes are saved under `rag/` in the writable config mount, including
+their text and embeddings. A successful PUT replaces the entire named index.
+Indexes survive a restart with the same config mount. Rebuild an index when
+its embedding provider endpoint or upstream model changes.
+
+Search embeds the query using the model recorded in the index. It returns up
+to `topK` chunks with positive cosine similarity, defaulting to five and
+allowing up to ten. The answer endpoint passes the same ranked chunks to the
+chat model as evidence and asks it to cite them using labels such as `[1]`.
+The response's `sources` map these labels to the evidence supplied to the
+model. An answer request with no matching chunks returns `422 no_context`.
+
 ## Container Stack
 
 ```bash
@@ -144,6 +174,7 @@ To verify a published Windows x64 Native AOT executable against a loopback Provi
 ```powershell
 python tests/native-aot-stream-embeddings.py <published-exe> <report-directory>
 python tests/native-aot-api-access.py <published-exe> <report-directory>
+python tests/native-aot-rag.py <published-exe> <report-directory>
 ```
 
 ## Python CLI

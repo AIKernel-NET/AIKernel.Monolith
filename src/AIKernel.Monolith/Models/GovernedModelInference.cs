@@ -52,8 +52,9 @@ internal sealed class GovernedModelInference(
         string? modelId,
         IReadOnlyList<string>? texts,
         string requestId,
-        CancellationToken cancellationToken)
-        => RunAsync<IReadOnlyList<float[]>>(modelId, requestId, "embeddings", "embedding",
+        CancellationToken cancellationToken,
+        string operation = "embeddings")
+        => RunAsync<IReadOnlyList<float[]>>(modelId, requestId, operation, "embedding",
             texts is null ? InferenceErrors.InvalidEmbeddingRequest : null, null,
             async (provider, token) => await provider.EmbedBatchAsync(texts!, token),
             cancellationToken);
