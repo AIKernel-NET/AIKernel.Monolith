@@ -9,7 +9,18 @@ internal static class RagEndpointExtensions
 {
     internal static void MapRagApi(this IEndpointRouteBuilder endpoints)
     {
-        var indexes = endpoints.MapGroup("/v1/rag/indexes/{indexId}");
+        var collection = endpoints.MapGroup("/v1/rag/indexes");
+        collection.MapGet("", (RagService rag, CancellationToken cancellationToken) =>
+            ToResult(rag.ListIndexes(cancellationToken), RagJsonContext.Default.RagIndexListResponse));
+
+        var indexes = collection.MapGroup("/{indexId}");
+        indexes.MapDelete("", async (string indexId, RagService rag, CancellationToken cancellationToken) =>
+            await rag.DeleteIndexAsync(indexId, cancellationToken) is { } error
+                ? ErrorResponse(error)
+                : Results.NoContent());
+
+        indexes.MapGet("/documents", async (string indexId, RagService rag, CancellationToken cancellationToken) =>
+            ToResult(await rag.ListDocumentsAsync(indexId, cancellationToken), RagJsonContext.Default.RagDocumentListResponse));
 
         indexes.MapPut("", async (string indexId, RagIndexRequest request, RagService rag,
             HttpContext context, CancellationToken cancellationToken) =>
@@ -39,7 +50,10 @@ internal static class RagEndpointExtensions
 
     private static IResult ToResult<T>(InferenceOutcome<T> outcome, JsonTypeInfo<T> typeInfo) where T : class
         => outcome.Error is { } error
-            ? Results.Json(new OpenAIErrorResponse(new OpenAIError(error.Message, error.Code)),
-                InferenceJsonContext.Default.OpenAIErrorResponse, statusCode: error.Status)
+            ? ErrorResponse(error)
             : Results.Json(outcome.Value!, typeInfo);
+
+    private static IResult ErrorResponse(InferenceError error)
+        => Results.Json(new OpenAIErrorResponse(new OpenAIError(error.Message, error.Code)),
+            InferenceJsonContext.Default.OpenAIErrorResponse, statusCode: error.Status);
 }

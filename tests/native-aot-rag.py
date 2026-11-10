@@ -22,7 +22,9 @@ read_request = helpers["read_request"]
 audit_entries = helpers["audit_entries"]
 
 KEY = "native-rag-test-only-key"
-INDEX = "/v1/rag/indexes/handbook"
+INDEXES = "/v1/rag/indexes"
+INDEX = INDEXES + "/handbook"
+ARCHIVE = INDEXES + "/archive"
 DOCUMENTS = INDEX + "/documents"
 QUESTION = "What is the orbital period?"
 FACT = "The orbital period of the example planet is 37 days."
@@ -140,10 +142,19 @@ def smoke(exe, output):
                     response = connection.getresponse()
                     data = response.read()
                     assert response.status == status, (method, route, status, response.status, data)
+                    if status == 204:
+                        assert not data
+                        return None
                     return json.loads(data)
 
             def put(port, model_id, docs, status=200, key=KEY):
                 return request(port, INDEX, {"embeddingModel": model_id, "documents": docs}, status, "PUT", key)
+
+            def list_indexes(port):
+                return request(port, INDEXES, None, 200, "GET")["indexes"]
+
+            def list_documents(port, index=INDEX):
+                return request(port, index + "/documents", None, 200, "GET")["documents"]
 
             def upsert(port, document, status=200, key=KEY):
                 return request(port, DOCUMENTS, document, status, "PUT", key)
@@ -160,6 +171,10 @@ def smoke(exe, output):
             write_models()
             try:
                 with start("index") as port:
+                    assert list_indexes(port) == []
+                    assert request(port, INDEXES, None, 401, "GET", key=None)["error"]["code"] == "unauthorized"
+                    assert request(port, DOCUMENTS, None, 404, "GET")["error"]["code"] == "index_not_found"
+                    assert request(port, ARCHIVE, None, 404, "DELETE")["error"]["code"] == "index_not_found"
                     assert request(port, INDEX + "/search", query, 404)["error"]["code"] == "index_not_found"
                     assert put(port, "embed", docs, 401, key=None)["error"]["code"] == "unauthorized"
                     assert put(port, "embed", [docs[0], docs[0]], 400)["error"]["code"] == "invalid_documents"
@@ -172,6 +187,15 @@ def smoke(exe, output):
                         "indexId": "handbook", "embeddingModel": "embed", "documentCount": 2, "chunkCount": 3,
                     }
                     assert calls[-1][1]["input"] == [PREFIX.strip(), FACT, OTHER]
+                    assert list_indexes(port) == ["handbook"]
+                    initial_docs = list_documents(port)
+                    assert initial_docs == [
+                        {"documentId": "accounting", "title": None, "source": None, "chunkCount": 1},
+                        {"documentId": "planet", "title": docs[0]["title"], "source": docs[0]["source"], "chunkCount": 2},
+                    ]
+                    request(port, ARCHIVE, {"embeddingModel": "embed", "documents": docs[:1]}, 200, "PUT")
+                    assert list_indexes(port) == ["archive", "handbook"]
+                    assert list_documents(port, ARCHIVE) == initial_docs[1:]
                     expected_search = request(port, INDEX + "/search", query, 200)
                     best, second = expected_search["hits"]
                     assert best == {"citation": "[1]", "score": 1, "text": FACT,
@@ -187,6 +211,8 @@ def smoke(exe, output):
                     assert zero["error"]["code"] == "invalid_embedding_vectors"
 
                 with start("restart") as port:
+                    assert list_indexes(port) == ["archive", "handbook"]
+                    assert list_documents(port) == initial_docs
                     assert request(port, INDEX + "/search", query, 200) == expected_search
                     no_evidence = request(port, INDEX + "/answer", {**question, "question": "No matches"}, 422)
                     assert no_evidence["error"]["code"] == "no_context"
@@ -208,6 +234,8 @@ def smoke(exe, output):
                         additions = [pool.submit(upsert, port, doc) for doc in (backup, extra)]
                         assert sorted(result.result()["documentCount"] for result in additions) == [3, 4]
                     assert sorted(call[1]["input"] for call in calls[count:]) == sorted([[BACKUP_FACT], [EXTRA_FACT]])
+                    listed_after_add = [doc["documentId"] for doc in list_documents(port)]
+                    assert listed_after_add == ["accounting", "almanac", "planet", BACKUP_ID]
 
                     update = {"id": "planet", "text": UPDATED_FACT, "title": "Updated planet handbook",
                               "source": "https://example.test/updated-planet"}
@@ -224,13 +252,37 @@ def smoke(exe, output):
                     failed_update = upsert(port, {**update, "text": "fail-replacement"}, 502)
                     assert failed_update["error"]["code"] == "provider_error"
                     assert request(port, INDEX + "/search", query, 200)["hits"] == updated
+                    assert list_documents(port)[2] == {
+                        "documentId": "planet", "title": update["title"], "source": update["source"], "chunkCount": 1,
+                    }
 
                     count = len(calls)
                     assert delete(port, "planet")["documentCount"] == 3
                     assert delete(port, "planet", 404)["error"]["code"] == "document_not_found"
+                    listed_after_delete = [doc["documentId"] for doc in list_documents(port)]
+                    assert listed_after_delete == ["accounting", "almanac", BACKUP_ID]
+                    assert len(calls) == count
+
+                    assert request(port, ARCHIVE + "/search", query, 200)["hits"] == expected_search["hits"]
+                    count = len(calls)
+                    assert request(port, ARCHIVE + "/documents", None, 401, "GET", key=None)["error"]["code"] == "unauthorized"
+                    assert request(port, ARCHIVE, None, 401, "DELETE", key=None)["error"]["code"] == "unauthorized"
+                    assert list_indexes(port) == ["archive", "handbook"]
+                    request(port, ARCHIVE, None, 204, "DELETE")
+                    assert not (roots["config"] / "rag" / "index-archive.json").exists()
+                    indexes_after_delete = list_indexes(port)
+                    assert indexes_after_delete == ["handbook"]
+                    assert request(port, ARCHIVE, None, 404, "DELETE")["error"]["code"] == "index_not_found"
+                    assert request(port, ARCHIVE + "/documents", None, 404, "GET")["error"]["code"] == "index_not_found"
+                    assert request(port, ARCHIVE + "/search", query, 404)["error"]["code"] == "index_not_found"
+                    assert request(port, ARCHIVE + "/answer", question, 404)["error"]["code"] == "index_not_found"
                     assert len(calls) == count
 
                 with start("document-mutations") as port:
+                    assert list_indexes(port) == indexes_after_delete
+                    assert [doc["documentId"] for doc in list_documents(port)] == listed_after_delete
+                    assert request(port, ARCHIVE + "/search", query, 404)["error"]["code"] == "index_not_found"
+                    assert request(port, ARCHIVE + "/answer", question, 404)["error"]["code"] == "index_not_found"
                     remaining = request(port, INDEX + "/search", query, 200)["hits"]
                     assert [hit["source"]["documentId"] for hit in remaining] == [BACKUP_ID, "almanac"]
                     assert [hit["text"] for hit in remaining] == [BACKUP_FACT, EXTRA_FACT]
@@ -248,6 +300,7 @@ def smoke(exe, output):
                     assert delete(port, BACKUP_ID)["documentCount"] == 2
                     assert delete(port, "almanac")["documentCount"] == 1
                     assert delete(port, "accounting")["chunkCount"] == 0
+                    assert list_documents(port) == [] and list_indexes(port) == ["handbook"]
                     assert request(port, INDEX + "/search", query, 200)["hits"] == []
                     assert request(port, INDEX + "/answer", question, 422)["error"]["code"] == "no_context"
                     assert len(calls) == count
@@ -275,6 +328,10 @@ def smoke(exe, output):
                           "failed_update_preserved_document": True, "empty_index_returns_no_hits": True,
                           "search_documents_after_delete": [hit["source"]["documentId"] for hit in remaining],
                           "answer_after_delete": after_delete["answer"],
+                          "listed_documents_after_add": listed_after_add,
+                          "listed_documents_after_delete": listed_after_delete,
+                          "listed_indexes_after_delete": indexes_after_delete,
+                          "deleted_index_search_and_answer_rejected": True,
                           "upstream_calls": len(calls), "audit_records": len(entries)}
                 (output / "rag-result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
                 print(json.dumps(result, indent=2))

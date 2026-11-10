@@ -4,6 +4,10 @@ internal sealed record RagIndexRequest(string? EmbeddingModel, RagDocument?[]? D
 internal sealed record RagDocument(string? Id, string? Text, string? Title, string? Source);
 internal sealed record RagIndexResponse(string IndexId, string EmbeddingModel, int DocumentCount, int ChunkCount);
 
+internal sealed record RagIndexListResponse(string[] Indexes);
+internal sealed record RagDocumentListResponse(string IndexId, RagDocumentSummary[] Documents);
+internal sealed record RagDocumentSummary(string DocumentId, string? Title, string? Source, int ChunkCount);
+
 internal sealed record RagSearchRequest(string? Query, int? TopK);
 internal sealed record RagAnswerRequest(string? Model, string? Question, int? TopK);
 internal sealed record RagSearchResponse(string IndexId, RagHit[] Hits);

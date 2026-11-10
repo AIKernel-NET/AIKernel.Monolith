@@ -7,6 +7,8 @@ namespace AIKernel.Monolith.Internal;
 [JsonSerializable(typeof(RagIndexRequest))]
 [JsonSerializable(typeof(RagDocument))]
 [JsonSerializable(typeof(RagIndexResponse))]
+[JsonSerializable(typeof(RagIndexListResponse))]
+[JsonSerializable(typeof(RagDocumentListResponse))]
 [JsonSerializable(typeof(RagSearchRequest))]
 [JsonSerializable(typeof(RagSearchResponse))]
 [JsonSerializable(typeof(RagAnswerRequest))]

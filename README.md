@@ -116,7 +116,10 @@ request budget, Core policy checks, and inference audit apply.
 
 | Method and route | JSON body | Result |
 | --- | --- | --- |
+| `GET /v1/rag/indexes` | No body | `indexes` array of index IDs in ordinal order |
+| `DELETE /v1/rag/indexes/{indexId}` | No body | Delete the entire index and return `204 No Content` |
 | `PUT /v1/rag/indexes/{indexId}` | `{"embeddingModel":"embed","documents":[{"id":"handbook","title":"Handbook","source":"https://example.com/handbook","text":"The office closes at 18:00."}]}` | Index ID, embedding model ID, and document and chunk counts |
+| `GET /v1/rag/indexes/{indexId}/documents` | No body | Index ID and document summaries with IDs, titles, sources, and chunk counts |
 | `PUT /v1/rag/indexes/{indexId}/documents` | `{"id":"handbook","title":"Updated handbook","text":"The office closes at 19:00."}` | Add or replace one document and return the current index counts |
 | `DELETE /v1/rag/indexes/{indexId}/documents?documentId=handbook` | No body. URL-encode the document ID in the query string. | Delete one document and return the current index counts |
 | `POST /v1/rag/indexes/{indexId}/search` | `{"query":"When does the office close?","topK":3}` | Ranked hits with citation labels, source metadata, chunk text, and cosine scores |
@@ -133,6 +136,8 @@ Indexes are saved under `rag/` in the writable config mount, including
 their text and embeddings. A successful PUT to the index route replaces the
 entire named index. Indexes survive a restart with the same config mount.
 Rebuild an index when its embedding provider endpoint or upstream model changes.
+Deleting an index removes its stored snapshot. Subsequent document, search,
+and answer requests for that ID return `404 index_not_found`.
 
 Document changes require an existing index. A document PUT replaces all
 chunks and metadata for the matching ID, or adds the document if its ID is
@@ -140,7 +145,8 @@ new. Only the supplied document is embedded. DELETE removes all chunks for
 the requested ID and returns `404 document_not_found` for an absent document.
 Both operations atomically save the updated index snapshot and reuse the
 vectors of other documents. An index remains available after its last
-document is deleted and returns an empty search result.
+document is deleted and returns empty document and search lists. Document
+summaries are sorted by document ID in ordinal order.
 
 Search embeds the query using the model recorded in the index. It returns up
 to `topK` chunks with positive cosine similarity, defaulting to five and

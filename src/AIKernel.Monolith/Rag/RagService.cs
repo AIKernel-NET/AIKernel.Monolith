@@ -17,7 +17,10 @@ internal sealed class RagService(
     private const int MaxChunks = 256;
     private const int BatchSize = 32;
 
-    private readonly SemaphoreSlim indexWriteLock = new(1);
+    private const string IndexFilePrefix = "index-";
+    private const string IndexFileSuffix = ".json";
+
+    private readonly SemaphoreSlim indexLock = new(1);
 
     private static readonly InferenceError InvalidIndexId =
         new(400, "invalid_index_id", "Use 1 to 64 lowercase ASCII letters, digits, hyphens or underscores for the index ID.");
@@ -42,7 +45,100 @@ internal sealed class RagService(
     private static readonly InferenceError InvalidVectors =
         new(502, "invalid_embedding_vectors", "The provider returned unusable embedding vectors.");
     private static readonly InferenceError StorageUnavailable =
-        new(503, "index_storage_unavailable", "The RAG index could not be read or saved.");
+        new(503, "index_storage_unavailable", "The RAG index storage is unavailable.");
+
+    internal InferenceOutcome<RagIndexListResponse> ListIndexes(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var ids = new List<string>();
+            foreach (var path in Directory.EnumerateFiles(IndexDirectory, $"{IndexFilePrefix}*{IndexFileSuffix}"))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var file = Path.GetFileName(path);
+                if (!file.StartsWith(IndexFilePrefix, StringComparison.Ordinal) ||
+                    !file.EndsWith(IndexFileSuffix, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var id = file[IndexFilePrefix.Length..^IndexFileSuffix.Length];
+                if (IsValidIndexId(id))
+                {
+                    ids.Add(id);
+                }
+            }
+
+            ids.Sort(StringComparer.Ordinal);
+            return new(Value: new RagIndexListResponse(ids.ToArray()));
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return new(Value: new RagIndexListResponse([]));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogError(ex, "Could not list RAG indexes");
+            return new(Error: StorageUnavailable);
+        }
+    }
+
+    internal async Task<InferenceOutcome<RagDocumentListResponse>> ListDocumentsAsync(
+        string indexId, CancellationToken cancellationToken)
+    {
+        if (!IsValidIndexId(indexId))
+        {
+            return new(Error: InvalidIndexId);
+        }
+
+        var current = await LoadIndexAsync(indexId, cancellationToken);
+        if (current.Error is { } error)
+        {
+            return new(Error: error);
+        }
+
+        var documents = current.Value!.Chunks.GroupBy(chunk => chunk.Source.DocumentId, StringComparer.Ordinal)
+            .OrderBy(document => document.Key, StringComparer.Ordinal)
+            .Select(document =>
+            {
+                var source = document.First().Source;
+                return new RagDocumentSummary(document.Key, source.Title, source.Source, document.Count());
+            })
+            .ToArray();
+        return new(Value: new RagDocumentListResponse(indexId, documents));
+    }
+
+    internal async Task<InferenceError?> DeleteIndexAsync(string indexId, CancellationToken cancellationToken)
+    {
+        if (!IsValidIndexId(indexId))
+        {
+            return InvalidIndexId;
+        }
+
+        await indexLock.WaitAsync(cancellationToken);
+        try
+        {
+            var path = IndexPath(indexId);
+            // File.Delete also succeeds for missing files, so check existence under the same lock.
+            _ = File.GetAttributes(path);
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Delete(path);
+            return null;
+        }
+        catch (IOException ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return MissingIndex;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogError(ex, "Could not delete RAG index {IndexId}", indexId);
+            return StorageUnavailable;
+        }
+        finally
+        {
+            indexLock.Release();
+        }
+    }
 
     internal async Task<InferenceOutcome<RagIndexResponse>> IndexAsync(
         string indexId, RagIndexRequest request, string requestId, CancellationToken cancellationToken)
@@ -142,7 +238,7 @@ internal sealed class RagService(
         }, cancellationToken);
     }
 
-    public void Dispose() => indexWriteLock.Dispose();
+    public void Dispose() => indexLock.Dispose();
 
     private async Task<InferenceOutcome<RagChunk[]>> EmbedChunksAsync(
         string modelId, List<(RagSource Source, string Text)> input, string requestId, string operation,
@@ -184,14 +280,14 @@ internal sealed class RagService(
         string indexId, Func<RagIndex, InferenceOutcome<RagIndex>> update, CancellationToken cancellationToken)
         => WriteIndexAsync(indexId, async () =>
         {
-            var current = await LoadIndexAsync(indexId, cancellationToken);
+            var current = await ReadIndexFileAsync(indexId, cancellationToken);
             return current.Error is { } error ? new(Error: error) : update(current.Value!);
         }, cancellationToken);
 
     private async Task<InferenceOutcome<RagIndexResponse>> WriteIndexAsync(
         string indexId, Func<Task<InferenceOutcome<RagIndex>>> prepare, CancellationToken cancellationToken)
     {
-        await indexWriteLock.WaitAsync(cancellationToken);
+        await indexLock.WaitAsync(cancellationToken);
         try
         {
             // Merge mutations against the latest snapshot after provider calls have finished.
@@ -209,7 +305,7 @@ internal sealed class RagService(
         }
         finally
         {
-            indexWriteLock.Release();
+            indexLock.Release();
         }
     }
 
@@ -364,6 +460,19 @@ internal sealed class RagService(
 
     private async Task<InferenceOutcome<RagIndex>> LoadIndexAsync(string indexId, CancellationToken cancellationToken)
     {
+        await indexLock.WaitAsync(cancellationToken);
+        try
+        {
+            return await ReadIndexFileAsync(indexId, cancellationToken);
+        }
+        finally
+        {
+            indexLock.Release();
+        }
+    }
+
+    private async Task<InferenceOutcome<RagIndex>> ReadIndexFileAsync(string indexId, CancellationToken cancellationToken)
+    {
         RagIndex? index;
         try
         {
@@ -454,7 +563,9 @@ internal sealed class RagService(
         return chunks;
     }
 
-    private string IndexPath(string id) => Path.Combine(mounts.ConfigRoot, "rag", $"index-{id}.json");
+    private string IndexDirectory => Path.Combine(mounts.ConfigRoot, "rag");
+
+    private string IndexPath(string id) => Path.Combine(IndexDirectory, $"{IndexFilePrefix}{id}{IndexFileSuffix}");
 
     private static bool IsValidIndexId(string id)
         => id.Length is > 0 and <= 64 &&
