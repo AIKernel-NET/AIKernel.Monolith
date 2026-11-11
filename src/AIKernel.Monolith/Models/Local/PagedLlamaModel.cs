@@ -12,7 +12,7 @@ using AIKernel.Monolith.OpenAI;
 
 namespace AIKernel.Monolith.Models.Local;
 
-internal sealed class PagedLlamaModel : IDisposable
+internal sealed partial class PagedLlamaModel : IDisposable
 {
     private static readonly IResourceAdmissibilityPolicy Admission = new ResourceAdmissibilityPolicy();
     private static readonly ErrorContext HealthUnavailable = new("Required device telemetry is unavailable.",
@@ -36,10 +36,13 @@ internal sealed class PagedLlamaModel : IDisposable
     private readonly int maxNewTokens;
     private readonly long checkpointBytes;
     private readonly MappedModelFile? mapped;
+    private readonly ILogger<PagedLlamaModel>? logger;
 
-    internal PagedLlamaModel(PagedLlamaSettings settings, CancellationToken token, IDeviceHealthTelemetry? healthTelemetry = null)
+    internal PagedLlamaModel(PagedLlamaSettings settings, CancellationToken token, IDeviceHealthTelemetry? healthTelemetry = null,
+        ILogger<PagedLlamaModel>? logger = null)
     {
         this.settings = settings;
+        this.logger = logger;
         deviceOrdinal = settings.Device;
         var extension = Path.GetExtension(settings.Checkpoint);
         var isMapped = extension.Equals(".gguf", StringComparison.OrdinalIgnoreCase) ||
@@ -245,23 +248,34 @@ internal sealed class PagedLlamaModel : IDisposable
                 if (candidate is null) continue;
 
                 var accepted = false;
+                var canceled = false;
+                var stage = "candidate";
+                string? targetPci = null;
+                long sourceKvPages = 0;
                 LayerQosScheduler.Lease? targetLease = null;
                 try
                 {
-                    var targetPci = candidate.GetPciBusId();
+                    targetPci = candidate.GetPciBusId();
                     if (targetPci is null || visitedDevices.Contains(targetPci) || MigrationTargetHealth(targetPci) is null)
                         continue;
 
                     if (!prepared)
                     {
-                        RequireMigration(memory.PrepareDeviceChange());
                         if (cache is not null && settings.KvVramBlocks != 0)
-                            RequireMigration(cache.PrepareDeviceChange());
+                        {
+                            stage = "kv_drain";
+                            sourceKvPages = cache.Statistics.VramBlocks;
+                            if (logger is not null) LogKvDrain(logger, previousPci, targetPci, sourceKvPages);
+                            RequireDrain(cache.PrepareDeviceChange(token));
+                        }
+                        stage = "weight_drain";
+                        RequireDrain(memory.PrepareDeviceChange(token));
                         previous.ZeroScratch();
                         execution.Release();
                         prepared = true;
                     }
 
+                    stage = "target_lease";
                     var entered = schedulerForDevice!(ordinal).Enter(settings.Priority, Spill, token);
                     if (!entered.IsSuccess)
                     {
@@ -271,6 +285,8 @@ internal sealed class PagedLlamaModel : IDisposable
                     targetLease = entered.Value!;
                     if (MigrationTargetHealth(targetPci) is not { } targetHealth) continue;
 
+                    stage = "target_bind";
+                    token.ThrowIfCancellationRequested();
                     var targetCompute = new TransformerCompute(candidate);
                     RequireMigration(memory.BindPreparedDevice(candidate));
                     if (cache is not null && settings.KvVramBlocks != 0)
@@ -307,16 +323,40 @@ internal sealed class PagedLlamaModel : IDisposable
                     previous.Dispose();
                     return targetHealth;
                 }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    canceled = true;
+                    thermalPlacementUnavailable = true;
+                    audit["gpu_migration_canceled_stage"] = stage;
+                    audit["gpu_migration_canceled_from_pci"] = previousPci;
+                    if (targetPci is not null) audit["gpu_migration_canceled_to_pci"] = targetPci;
+                    if (stage == "kv_drain")
+                    {
+                        audit["gpu_migration_source_kv_vram_before"] = sourceKvPages.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        audit["gpu_migration_source_kv_vram_remaining"] = cache!.Statistics.VramBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    }
+                    throw;
+                }
                 finally
                 {
                     targetLease?.Dispose();
-                    if (!accepted) candidate.Dispose();
+                    if (!accepted)
+                    {
+                        candidate.Dispose();
+                        if (canceled) audit["gpu_migration_candidate_released"] = "true";
+                    }
                 }
             }
 
             thermalPlacementUnavailable = true;
             throw new InferenceGovernanceException(new ErrorContext("No other permitted CUDA device meets the thermal and resource limits.",
                 "device_thermal_migration_unavailable", true) { FailureKind = FailureKind.FailClosed });
+        }
+
+        void RequireDrain(Result<int> result)
+        {
+            if (result.Error?.Code == "virtual_memory_device_change_canceled") token.ThrowIfCancellationRequested();
+            RequireMigration(result);
         }
 
         DeviceHealthSnapshot? MigrationTargetHealth(string targetPci)
@@ -464,6 +504,9 @@ internal sealed class PagedLlamaModel : IDisposable
             throw new InferenceGovernanceException(new ErrorContext(result.Error!.Message, "device_thermal_migration_failed", false)
             { FailureKind = FailureKind.FailClosed });
     }
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "Draining KV cache from {SourcePci} toward {TargetPci} ({SourceKvPages} VRAM pages)")]
+    private static partial void LogKvDrain(ILogger logger, string sourcePci, string targetPci, long sourceKvPages);
 
     private sealed class DeviceExecution : IDisposable
     {

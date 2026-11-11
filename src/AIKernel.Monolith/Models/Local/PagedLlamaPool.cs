@@ -9,7 +9,7 @@ using AIKernel.Monolith.OpenAI;
 
 namespace AIKernel.Monolith.Models.Local;
 
-internal sealed class PagedLlamaPool : IDisposable
+internal sealed class PagedLlamaPool(ILogger<PagedLlamaModel> logger) : IDisposable
 {
     private readonly ConcurrentDictionary<string, Session> sessions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<int, LayerQosScheduler> devices = new();
@@ -21,7 +21,7 @@ internal sealed class PagedLlamaPool : IDisposable
         await session.Lock.WaitAsync(token);
         try
         {
-            session.Model ??= new PagedLlamaModel(settings, token);
+            session.Model ??= new PagedLlamaModel(settings, token, logger: logger);
             return Result<string>.Success(await session.Model.GenerateAsync(messages, emit, audit, null, token,
                 schedulerForDevice: GetScheduler));
         }

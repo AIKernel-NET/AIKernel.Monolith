@@ -93,7 +93,7 @@ internal sealed class PagedKvCache : IDisposable
 
     internal Result<int> DemoteDeviceBlocks() => memory.DemoteDeviceBlocks();
 
-    internal Result<int> PrepareDeviceChange() => memory.PrepareDeviceChange();
+    internal Result<int> PrepareDeviceChange(CancellationToken token) => memory.PrepareDeviceChange(token);
 
     internal Result<bool> BindPreparedDevice(CudaVirtualMemoryDevice device) => memory.BindPreparedDevice(device);
 
