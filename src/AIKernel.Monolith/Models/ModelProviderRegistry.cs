@@ -4,6 +4,7 @@ using AIKernel.Dtos.Governance;
 using AIKernel.Enums.Governance;
 using AIKernel.Monolith.Hosting;
 using AIKernel.Monolith.Internal;
+using AIKernel.Monolith.Models.Local;
 using AIKernel.Providers.ChatOpenAI;
 
 namespace AIKernel.Monolith.Models;
@@ -14,6 +15,7 @@ namespace AIKernel.Monolith.Models;
 public sealed class ModelProviderRegistry
 {
     private const string ChatOpenAIProviderId = "providers.openai";
+    private const string PagedLlamaProviderId = "providers.paged-llama";
     private readonly Dictionary<string, RegisteredModel> models = new(StringComparer.Ordinal);
 
     public ModelProviderRegistry(MountOptions mountOptions)
@@ -29,12 +31,14 @@ public sealed class ModelProviderRegistry
 
             foreach (var registration in registrations ?? [])
             {
-                if (registration?.Provider != ChatOpenAIProviderId)
+                if (registration?.Provider is not (ChatOpenAIProviderId or PagedLlamaProviderId))
                 {
                     continue;
                 }
 
-                var model = CreateModel(registration, path);
+                var model = registration.Provider == PagedLlamaProviderId
+                    ? CreateLocalModel(registration, mountOptions, path)
+                    : CreateModel(registration, path);
                 if (!models.TryAdd(model.Metadata.Id, model))
                 {
                     throw new InvalidDataException($"Duplicate model ID '{model.Metadata.Id}' in '{path}'.");
@@ -76,13 +80,60 @@ public sealed class ModelProviderRegistry
             new ModelMetadata(registration.Id, ChatOpenAIProviderId, kind),
             settings,
             registration.ApiKeyEnvironmentVariable,
-            new GateInput
-            {
-                Logos = ParseVote(registration.Policy?.Logos),
-                Ethos = ParseVote(registration.Policy?.Ethos),
-                Pathos = ParseVote(registration.Policy?.Pathos)
-            });
+            ReadPolicy(registration.Policy));
     }
+
+    private static RegisteredModel CreateLocalModel(ModelRegistration registration, MountOptions mounts, string path)
+    {
+        var config = registration.Local;
+        var blockSize = config?.BlockSize ?? 2 * 1024 * 1024;
+        var ramBlocks = config?.RamBlocks ?? 32;
+        var vramBlocks = config?.VramBlocks ?? 32;
+        var context = config?.ContextTokens ?? 512;
+        var maxNew = config?.MaxNewTokens ?? 32;
+        var device = config?.Device ?? 0;
+        if (string.IsNullOrWhiteSpace(registration.Id) || registration.Kind is not (null or "chat") ||
+            registration.Endpoint is not null || registration.ApiKeyEnvironmentVariable is not null ||
+            config is null || blockSize is < 4096 or > 32 * 1024 * 1024 || (blockSize & (blockSize - 1)) != 0 ||
+            ramBlocks <= 0 || vramBlocks <= 0 || device < 0 || context is < 8 or > 2048 || maxNew is < 1 or > 128)
+        {
+            throw new InvalidDataException($"Invalid paged Llama model registration in '{path}'.");
+        }
+
+        var local = new PagedLlamaSettings(
+            ResolveAsset(mounts.ModelRoot, config.Checkpoint, path),
+            ResolveAsset(mounts.ModelRoot, config.Tokenizer, path),
+            Path.Combine(mounts.ConfigRoot, "model-swap"),
+            blockSize, ramBlocks, vramBlocks, device, context, maxNew);
+        return new RegisteredModel(new ModelMetadata(registration.Id, PagedLlamaProviderId, "chat"),
+            null, null, ReadPolicy(registration.Policy), local);
+    }
+
+    private static string ResolveAsset(string modelRoot, string? asset, string registrationPath)
+    {
+        if (string.IsNullOrWhiteSpace(asset) || Path.IsPathRooted(asset))
+        {
+            throw new InvalidDataException($"Expected a path relative to the model mount in '{registrationPath}'.");
+        }
+
+        var root = Path.GetFullPath(modelRoot);
+        var fullPath = Path.GetFullPath(asset, root);
+        var relative = Path.GetRelativePath(root, fullPath);
+        if (relative is "." or ".." || relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+            || Path.IsPathRooted(relative))
+        {
+            throw new InvalidDataException($"A model path escapes the model mount in '{registrationPath}'.");
+        }
+
+        return fullPath;
+    }
+
+    private static GateInput ReadPolicy(ModelPolicy? policy) => new()
+    {
+        Logos = ParseVote(policy?.Logos),
+        Ethos = ParseVote(policy?.Ethos),
+        Pathos = ParseVote(policy?.Pathos)
+    };
 
     private static CouncilVoteValue ParseVote(string? vote) => vote switch
     {
@@ -95,9 +146,10 @@ public sealed class ModelProviderRegistry
 
 internal sealed record RegisteredModel(
     ModelMetadata Metadata,
-    ChatOpenAISettings Settings,
+    ChatOpenAISettings? Settings,
     string? ApiKeyEnvironmentVariable,
-    GateInput Policy);
+    GateInput Policy,
+    PagedLlamaSettings? Local = null);
 
 internal sealed record ModelRegistration(
     [property: JsonPropertyName("id")] string? Id,
@@ -106,7 +158,8 @@ internal sealed record ModelRegistration(
     [property: JsonPropertyName("endpoint")] string? Endpoint,
     [property: JsonPropertyName("model")] string? Model,
     [property: JsonPropertyName("apiKeyEnvironmentVariable")] string? ApiKeyEnvironmentVariable,
-    [property: JsonPropertyName("policy")] ModelPolicy? Policy);
+    [property: JsonPropertyName("policy")] ModelPolicy? Policy,
+    [property: JsonPropertyName("local")] PagedLlamaRegistration? Local);
 
 internal sealed record ModelPolicy(
     [property: JsonPropertyName("logos")] string? Logos,

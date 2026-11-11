@@ -56,7 +56,14 @@ def smoke(exe, output):
             directory.mkdir()
         audit = roots["config"] / "inference-audit.jsonl"
         calls = []
-        concurrent_adds = threading.Barrier(2, timeout=10)
+        def confirm_upsert_policies():
+            decisions = audit_entries(audit)[-2:]
+            assert len(decisions) == 2
+            assert all(row["EventType"] == "inference.policy" and row["Description"] == "allowed"
+                       and row["Metadata"]["operation"] == "rag.document.upsert" for row in decisions)
+            assert len({row["Metadata"]["request_id"] for row in decisions}) == 2
+
+        concurrent_adds = threading.Barrier(2, action=confirm_upsert_policies, timeout=10)
         stream_modes = iter(("live", "truncated", "early-error", "empty"))
         release_stream = threading.Event()
 
@@ -65,8 +72,9 @@ def smoke(exe, output):
                 body = read_request(self)
                 if body.get("input") in ([BACKUP_FACT], [EXTRA_FACT]):
                     concurrent_adds.wait()
-                decision = audit_entries(audit)[-1]
-                assert decision["EventType"] == "inference.policy" and decision["Description"] == "allowed"
+                else:
+                    decision = audit_entries(audit)[-1]
+                    assert decision["EventType"] == "inference.policy" and decision["Description"] == "allowed"
                 calls.append((self.path, body))
                 if self.path == "/embed/v1/embeddings":
                     assert body["model"] == "upstream-embedding"

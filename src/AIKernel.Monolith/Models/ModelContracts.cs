@@ -39,4 +39,7 @@ public sealed record ModelCompletionRequest(string Model, string Prompt);
 /// <summary>
 /// EN: Completion response. JA: Completion 応答です。
 /// </summary>
-public sealed record ModelCompletion(string Id, string Text);
+public sealed record ModelCompletion(string Id, string Text)
+{
+    internal string FinishReason { get; init; } = "stop";
+}

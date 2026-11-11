@@ -38,7 +38,7 @@ public static class OpenAIEndpointExtensions
 
             var completion = outcome.Value!;
             return Results.Json(
-                new CompletionResponse(completion.Id, "text_completion", [new CompletionChoice(completion.Text, 0, "stop")]),
+                new CompletionResponse(completion.Id, "text_completion", [new CompletionChoice(completion.Text, 0, completion.FinishReason)]),
                 MonolithJsonContext.Default.CompletionResponse);
         });
 
@@ -60,7 +60,7 @@ public static class OpenAIEndpointExtensions
 
             var completion = outcome.Value!;
             return Results.Json(
-                new ChatCompletionResponse(completion.Id, "chat.completion", [new ChatChoice(0, new ChatResponseMessage("assistant", completion.Text), "stop")]),
+                new ChatCompletionResponse(completion.Id, "chat.completion", [new ChatChoice(0, new ChatResponseMessage("assistant", completion.Text), completion.FinishReason)]),
                 MonolithJsonContext.Default.ChatCompletionResponse);
         });
 

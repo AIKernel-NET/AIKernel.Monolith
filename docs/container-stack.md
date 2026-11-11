@@ -29,7 +29,7 @@ Runtime data must be mounted externally. Missing mounts cause startup failure. T
 
 ## Container Stack Architecture
 
-- `Dockerfile.base`: AOT binary and samples. Pass the sibling AIKernel.Providers checkout as the `aikernel-providers` build context.
+- `Dockerfile.base`: AOT binary and samples. Pass the sibling AIKernel.Providers and AIKernel.Core checkouts as the `aikernel-providers` and `aikernel-core` build contexts.
 - `Dockerfile.linux`: Linux native ABI layer.
 - `Dockerfile.windows`: Windows native ABI layer.
 

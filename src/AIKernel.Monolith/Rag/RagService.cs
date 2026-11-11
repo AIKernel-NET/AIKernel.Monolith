@@ -548,7 +548,8 @@ internal sealed class RagService(
     }
 
     private bool HasEmbeddingModelChanged(RagEmbeddingModel model)
-        => registry.Find(model.Id) is { } registered && DescribeEmbeddingModel(registered) != model;
+        => registry.Find(model.Id) is { } registered &&
+            (registered.Settings is null || DescribeEmbeddingModel(registered) != model);
 
     private static int CountDocuments(RagChunk[] chunks)
         => chunks.Select(chunk => chunk.Source.DocumentId).Distinct(StringComparer.Ordinal).Count();
@@ -619,7 +620,7 @@ internal sealed class RagService(
             id.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '-' or '_');
 
     private static RagEmbeddingModel DescribeEmbeddingModel(RegisteredModel model)
-        => new(model.Metadata.Id, model.Metadata.Provider, model.Settings.Endpoint.AbsoluteUri,
+        => new(model.Metadata.Id, model.Metadata.Provider, model.Settings!.Endpoint.AbsoluteUri,
             model.Settings.EmbeddingModel ?? string.Empty);
 
     private static double MagnitudeSquared(float[] vector)

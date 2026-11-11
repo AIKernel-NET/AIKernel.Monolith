@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using AIKernel.Abstractions.Events;
 using AIKernel.Abstractions.Governance;
@@ -6,6 +7,7 @@ using AIKernel.Dtos.Governance;
 using AIKernel.Enums;
 using AIKernel.Enums.Governance;
 using AIKernel.Monolith.OpenAI;
+using AIKernel.Monolith.Models.Local;
 using AIKernel.Providers.ChatOpenAI;
 
 namespace AIKernel.Monolith.Models;
@@ -15,6 +17,7 @@ internal sealed class GovernedModelInference(
     IDecisionGate gate,
     IAuditEventWriter audit,
     IHttpClientFactory clients,
+    PagedLlamaPool localModels,
     ILogger<GovernedModelInference> logger)
 {
     internal const string HttpClientName = "monolith-inference";
@@ -32,7 +35,16 @@ internal sealed class GovernedModelInference(
             {
                 var text = await provider.GenerateAsync(messages!, token);
                 return string.IsNullOrEmpty(text) ? null : new ModelCompletion(id, text);
-            }, cancellationToken);
+            }, cancellationToken, async (settings, metadata, token) =>
+            {
+                var text = new StringBuilder();
+                var finishReason = await localModels.GenerateAsync(modelId!, settings, messages!, chunk =>
+                {
+                    text.Append(chunk);
+                    return Task.CompletedTask;
+                }, metadata, token);
+                return text.Length == 0 ? null : new ModelCompletion(id, text.ToString()) { FinishReason = finishReason };
+            });
     }
 
     internal Task<InferenceOutcome<string>> StreamAsync(
@@ -46,7 +58,8 @@ internal sealed class GovernedModelInference(
         => RunAsync<string>(modelId, requestId, operation, "chat",
             ValidateMessages(messages), completionId,
             async (provider, token) => await provider.StreamCompletionAsync(messages!, onChunk, token),
-            cancellationToken);
+            cancellationToken, async (settings, metadata, token) =>
+                await localModels.GenerateAsync(modelId!, settings, messages!, onChunk, metadata, token));
 
     internal Task<InferenceOutcome<IReadOnlyList<float[]>>> EmbedAsync(
         string? modelId,
@@ -75,7 +88,8 @@ internal sealed class GovernedModelInference(
         InferenceError? inputError,
         string? completionId,
         Func<ChatOpenAIProvider, CancellationToken, Task<T?>> execute,
-        CancellationToken cancellationToken) where T : class
+        CancellationToken cancellationToken,
+        Func<PagedLlamaSettings, Dictionary<string, string>, CancellationToken, Task<T?>>? executeLocal = null) where T : class
     {
         var model = modelId is null ? null : registry.Find(modelId);
         var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -134,19 +148,28 @@ internal sealed class GovernedModelInference(
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var apiKey = model.ApiKeyEnvironmentVariable is { } variable
-                ? Environment.GetEnvironmentVariable(variable)
-                : null;
-            if (model.ApiKeyEnvironmentVariable is not null && string.IsNullOrWhiteSpace(apiKey))
+            T? value;
+            if (model.Local is { } local)
             {
-                return await ProviderFailedAsync("credential_unavailable");
+                value = await executeLocal!(local, metadata, cancellationToken);
+            }
+            else
+            {
+                var apiKey = model.ApiKeyEnvironmentVariable is { } variable
+                    ? Environment.GetEnvironmentVariable(variable)
+                    : null;
+                if (model.ApiKeyEnvironmentVariable is not null && string.IsNullOrWhiteSpace(apiKey))
+                {
+                    return await ProviderFailedAsync("credential_unavailable");
+                }
+
+                var settings = model.Settings! with { ApiKey = apiKey };
+                using var httpClient = clients.CreateClient(HttpClientName);
+                var provider = new ChatOpenAIProvider(settings, new ChatOpenAIClient(httpClient, settings));
+                await provider.InitializeAsync();
+                value = await execute(provider, cancellationToken);
             }
 
-            var settings = model.Settings with { ApiKey = apiKey };
-            using var httpClient = clients.CreateClient(HttpClientName);
-            var provider = new ChatOpenAIProvider(settings, new ChatOpenAIClient(httpClient, settings));
-            await provider.InitializeAsync();
-            var value = await execute(provider, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             if (value is null)
             {
@@ -156,6 +179,15 @@ internal sealed class GovernedModelInference(
             return await RecordAsync("inference.execution", "succeeded", AuditSeverity.Information)
                 ? new(Value: value)
                 : new(Error: InferenceErrors.AuditUnavailable);
+        }
+        catch (LocalContextLengthException)
+        {
+            return await RejectAsync(InferenceErrors.ContextLengthExceeded);
+        }
+        catch (LocalModelException ex)
+        {
+            logger.LogWarning(ex.InnerException, "Local inference failed for request {RequestId}", requestId);
+            return await ProviderFailedAsync("provider_error");
         }
         catch (Exception ex) when (ex is HttpRequestException or JsonException or InvalidDataException
             or IOException or OperationCanceledException)
@@ -204,6 +236,8 @@ internal static class InferenceErrors
 {
     internal static readonly InferenceError InvalidRequest =
         new(400, "invalid_request", "A model ID and valid text messages are required.");
+    internal static readonly InferenceError ContextLengthExceeded =
+        new(400, "context_length_exceeded", "The prompt exceeds the configured local model context.");
     internal static readonly InferenceError InvalidEmbeddingRequest =
         new(400, "invalid_request", "Provide one to 2048 non-empty texts and use float encoding.");
     internal static readonly InferenceError ModelNotFound =

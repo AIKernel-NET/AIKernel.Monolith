@@ -3,7 +3,11 @@ WORKDIR /src/AIKernel.Monolith
 COPY . .
 COPY --from=aikernel-providers Directory.Build.props /src/AIKernel.Providers/
 COPY --from=aikernel-providers src/Chat/ChatOpenAIProvider/*.cs src/Chat/ChatOpenAIProvider/*.csproj src/Chat/ChatOpenAIProvider/openai.provider.json /src/AIKernel.Providers/src/Chat/ChatOpenAIProvider/
-RUN dotnet publish src/AIKernel.Monolith/AIKernel.Monolith.csproj -c Release -r linux-x64 --self-contained true -o /out /p:PublishAot=true
+COPY --from=aikernel-core Directory.Build.props /src/AIKernel.Core/
+COPY --from=aikernel-core src/AIKernel.Common /src/AIKernel.Core/src/AIKernel.Common
+COPY --from=aikernel-core src/AIKernel.Core /src/AIKernel.Core/src/AIKernel.Core
+COPY --from=aikernel-core src/AIKernel.Kernel /src/AIKernel.Core/src/AIKernel.Kernel
+RUN dotnet publish src/AIKernel.Monolith/AIKernel.Monolith.csproj -c Release -r linux-x64 --self-contained true -o /out /p:PublishAot=true /p:GeneratePackageOnBuild=false
 
 FROM mcr.microsoft.com/dotnet/runtime-deps:10.0
 WORKDIR /aikernel

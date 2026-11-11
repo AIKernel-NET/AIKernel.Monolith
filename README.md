@@ -109,6 +109,57 @@ Register an embedding model with `kind: "embedding"` and its upstream model ID.
 returns floating-point vectors in input order. A chat registration only accepts
 completion requests, and an embedding registration only accepts embedding requests.
 
+### Local paged CUDA inference
+
+Register a `providers.paged-llama` chat model under the model mount. This
+provider accepts the legacy llama2.c little-endian FP32 checkpoint format
+and the matching binary tokenizer. It runs the Transformer in the host with
+CUDA matrix-vector multiplication over resident weight blocks. A 64-bit
+Windows or Linux host with an NVIDIA driver provides the device backend.
+
+```json
+{
+  "id": "local-stories",
+  "provider": "providers.paged-llama",
+  "kind": "chat",
+  "local": {
+    "checkpoint": "stories260K.bin",
+    "tokenizer": "tok512.bin",
+    "device": 0,
+    "blockSize": 4096,
+    "ramBlocks": 4,
+    "vramBlocks": 2,
+    "contextTokens": 64,
+    "maxNewTokens": 8
+  },
+  "policy": { "logos": "approve", "ethos": "approve", "pathos": "approve" }
+}
+```
+
+Asset paths are relative to the model mount. Model weights load on the first
+authorized request and stay cached until the host exits. Place the config
+mount on a private writable SSD directory for the swap files under
+`model-swap/`. Allow disk capacity for the model's nonresident blocks.
+`blockSize` is a power of two from 4 KiB to 32 MiB and must fit a matrix row.
+The defaults are 2 MiB per block, 32 RAM blocks, 32 VRAM blocks, CUDA device
+ordinal 0, a 512-token context, and at most 32 generated tokens. The weight
+budgets cover resident model blocks. The runtime also uses host KV cache
+and staging memory, a CUDA context, and device input/output buffers.
+
+The local model works with `/v1/completions` and `/v1/chat/completions`,
+including SSE. A single user message is used as a raw prompt. Multiple
+messages are formatted as role-prefixed lines. Tokens are selected greedily.
+The audit log records resident weight counts, swap reads, VRAM page-ins,
+and CUDA matrix blocks processed for each successful request.
+
+To exercise the published Windows x64 executable with the
+[TinyStories 260K model and tokenizer](https://huggingface.co/karpathy/tinyllamas/tree/0bd21da/stories260K),
+put `stories260K.bin` and `tok512.bin` in the model asset directory and run:
+
+```powershell
+python tests/native-aot-paged-llama.py <published-exe> <model-assets-directory> <report-directory> 0
+```
+
 ## Retrieval-Augmented Generation
 
 RAG uses registered embedding and chat models. The same Monolith bearer token,
@@ -204,13 +255,16 @@ and end without `[DONE]`.
 ## Container Stack
 
 ```bash
-docker build --build-context aikernel-providers=../AIKernel.Providers -f docker/Dockerfile.base -t aikernel/monolith:base .
+docker build --build-context aikernel-providers=../AIKernel.Providers --build-context aikernel-core=../AIKernel.Core -f docker/Dockerfile.base -t aikernel/monolith:base .
 docker build -f docker/Dockerfile.linux -t aikernel/monolith:linux .
 docker build -f docker/Dockerfile.windows -t aikernel/monolith:windows .
 ```
 
 The base image contains the AOT-compiled monolith binary, entrypoint, and sample configuration. Linux and Windows images extend it with platform-specific native ABI layers.
-The native build uses the sibling AIKernel.Providers checkout for the AOT-safe ChatOpenAI client. For a checkout without the Provider sources, set `ChatOpenAIProviderPackageVersion` to a package version that includes the streaming and embedding APIs.
+The native build uses the sibling AIKernel.Core and AIKernel.Providers checkouts.
+Point `AIKernelKernelProject` and `ChatOpenAIProviderProject` at alternate source projects as needed.
+Package-based builds can set `AIKernelKernelPackageVersion` and `ChatOpenAIProviderPackageVersion`
+to versions with paged CUDA support and streaming/embedding support respectively.
 
 Run with explicit mounts:
 

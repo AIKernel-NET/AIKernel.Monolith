@@ -4,6 +4,7 @@ using AIKernel.Core.Governance;
 using AIKernel.Monolith.Capabilities;
 using AIKernel.Monolith.Internal;
 using AIKernel.Monolith.Models;
+using AIKernel.Monolith.Models.Local;
 using AIKernel.Monolith.Rag;
 using AIKernel.Monolith.Routing;
 using AIKernel.Monolith.VFS;
@@ -31,6 +32,7 @@ public static class MonolithServiceCollectionExtensions
         services.AddSingleton<ModelProviderRegistry>();
         services.AddSingleton<IDecisionGate>(_ => new CtgDecisionGateEvaluator());
         services.AddSingleton<IAuditEventWriter, FileInferenceAuditWriter>();
+        services.AddSingleton<PagedLlamaPool>();
         services.AddSingleton<GovernedModelInference>();
         services.AddSingleton<RagService>();
         services.AddHttpClient(GovernedModelInference.HttpClientName)
