@@ -185,6 +185,7 @@ internal sealed class PagedLlamaModel : IDisposable
         if (restored is not null) ValidateContinuation(restored, tokens);
         using var kv = cache = new PagedKvCache(shape, settings, cuda, compute, restored);
         HashSet<string>? visitedDevices = null;
+        HashSet<int>? visitedOrdinals = null;
         var migrations = 0;
         var generatedTokens = 0;
         long forwardLayers = 0;
@@ -214,6 +215,8 @@ internal sealed class PagedLlamaModel : IDisposable
             var previousPci = pciBusId!;
             visitedDevices ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             visitedDevices.Add(previousPci);
+            visitedOrdinals ??= [];
+            visitedOrdinals.Add(deviceOrdinal);
             var allowed = settings.ThermalMigrationDevices;
             var deviceCount = allowed?.Length ?? CudaVirtualMemoryDevice.GetDeviceCount().Value;
             var prepared = false;
@@ -221,7 +224,7 @@ internal sealed class PagedLlamaModel : IDisposable
             {
                 token.ThrowIfCancellationRequested();
                 var ordinal = allowed is null ? index : allowed[index];
-                if (ordinal == deviceOrdinal) continue;
+                if (visitedOrdinals.Contains(ordinal)) continue;
                 var candidate = CudaVirtualMemoryDevice.TryCreate(ordinal, out _);
                 if (candidate is null) continue;
 
@@ -273,6 +276,7 @@ internal sealed class PagedLlamaModel : IDisposable
                     targetLease = null;
                     accepted = true;
                     visitedDevices.Add(targetPci);
+                    visitedOrdinals.Add(ordinal);
                     migrations++;
                     audit["gpu_migrations"] = migrations.ToString(System.Globalization.CultureInfo.InvariantCulture);
                     audit["gpu_migration_from_pci"] = previousPci;
