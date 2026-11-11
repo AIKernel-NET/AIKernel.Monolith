@@ -22,6 +22,7 @@ internal sealed class PagedLlamaModel : IDisposable
     private readonly NvmlDeviceTelemetry? ownedTelemetry;
     private string? pciBusId;
     private int deviceOrdinal;
+    private bool thermalPlacementUnavailable;
     private readonly bool telemetryFallback;
     private readonly long parameters;
     private readonly int quantizationBits;
@@ -134,6 +135,11 @@ internal sealed class PagedLlamaModel : IDisposable
 
         if (telemetryFallback) audit["device_route"] = "cpu_telemetry_unavailable";
         PagedKvCache? cache = null;
+        HashSet<string>? visitedDevices = null;
+        HashSet<int>? visitedOrdinals = null;
+        var migrations = 0;
+        var generatedTokens = 0;
+        long forwardLayers = 0;
         using var execution = new DeviceExecution();
         if (cuda is not null)
         {
@@ -149,27 +155,39 @@ internal sealed class PagedLlamaModel : IDisposable
         var weightVram = useGpu ? (available.VramBlocks + initial.VramBlocks) * (long)settings.BlockSize : 0;
         var kvVram = useGpu ? settings.KvVramBlocks * (long)kvBlockBytes : 0;
         var configuredVram = weightVram + kvVram;
-        var physicalVram = configuredVram;
         var request = new InferenceResourceRequest(parameters, quantizationBits, shape.BlockCount * settings.BlockSize,
             shape.Layers.Length, 2 * shape.KvDimension * sizeof(float), tokens.Count,
             Math.Min(maxNewTokens, shape.Context - tokens.Count + 1));
+        var budget = new InferenceResourceBudget(settings.BlockSize, kvBlockBytes,
+            (available.RamBlocks + initial.RamBlocks) * (long)settings.BlockSize +
+                settings.KvRamBlocks * (long)kvBlockBytes, configuredVram,
+            settings.MaxPcieSwapBytes, useGpu, weightVram, kvVram);
 
         if (useGpu && settings.HealthLimits != default)
         {
-            var health = Require(CheckHealth());
+            var currentHealth = CheckHealth();
+            DeviceHealthSnapshot health;
+            if (thermalPlacementUnavailable && currentHealth.Error?.Code == "device_temperature_exceeded"
+                && schedulerForDevice is not null)
+            {
+                health = Migrate(0, layer: null);
+                initial = memory.GetStatistics();
+            }
+            else
+                health = Require(currentHealth);
             var reclaimable = (ulong)initial.VramBlocks * (ulong)settings.BlockSize;
-            physicalVram = (long)Math.Min((ulong)physicalVram,
-                Math.Min(health.VramFreeBytes, (ulong)long.MaxValue - reclaimable) + reclaimable);
+            budget = budget with
+            {
+                AvailableVramBytes = (long)Math.Min((ulong)configuredVram,
+                    Math.Min(health.VramFreeBytes, (ulong)long.MaxValue - reclaimable) + reclaimable)
+            };
             audit["device_temperature_celsius"] = health.TemperatureCelsius.ToString(System.Globalization.CultureInfo.InvariantCulture);
         }
 
-        var budget = new InferenceResourceBudget(settings.BlockSize, kvBlockBytes,
-            (available.RamBlocks + initial.RamBlocks) * (long)settings.BlockSize +
-                settings.KvRamBlocks * (long)kvBlockBytes, physicalVram,
-            settings.MaxPcieSwapBytes, useGpu, weightVram, kvVram);
         var gate = ResultStep<InferenceResourceRequest, InferenceResourceEstimate>.FromResult(request,
             Admission.Evaluate(request, budget));
         var estimate = Require(gate.ToResult());
+        thermalPlacementUnavailable = false;
         audit["resource_minimum_ram_blocks"] = estimate.MinimumRamBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
         audit["resource_minimum_vram_blocks"] = estimate.MinimumVramBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
         audit["resource_estimated_pcie_bytes"] = estimate.EstimatedPcieBytes.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -184,16 +202,14 @@ internal sealed class PagedLlamaModel : IDisposable
             : null;
         if (restored is not null) ValidateContinuation(restored, tokens);
         using var kv = cache = new PagedKvCache(shape, settings, cuda, compute, restored);
-        HashSet<string>? visitedDevices = null;
-        HashSet<int>? visitedOrdinals = null;
-        var migrations = 0;
-        var generatedTokens = 0;
-        long forwardLayers = 0;
         using var state = new ForwardState(shape, weights, compute, kv, settings, CheckLayer);
         Result<int> Spill()
         {
-            var kvSpill = cache!.DemoteDeviceBlocks();
-            if (!kvSpill.IsSuccess) return kvSpill;
+            if (cache is { } active)
+            {
+                var kvSpill = active.DemoteDeviceBlocks();
+                if (!kvSpill.IsSuccess) return kvSpill;
+            }
             return memory.DemoteDeviceBlocks();
         }
         TransformerCompute CheckLayer(int position, int layer)
@@ -209,7 +225,7 @@ internal sealed class PagedLlamaModel : IDisposable
             return compute;
         }
 
-        void Migrate(int position, int layer)
+        DeviceHealthSnapshot Migrate(int position, int? layer)
         {
             var previous = cuda!;
             var previousPci = pciBusId!;
@@ -233,13 +249,14 @@ internal sealed class PagedLlamaModel : IDisposable
                 try
                 {
                     var targetPci = candidate.GetPciBusId();
-                    if (targetPci is null || visitedDevices.Contains(targetPci) || !CanMigrate(targetPci))
+                    if (targetPci is null || visitedDevices.Contains(targetPci) || MigrationTargetHealth(targetPci) is null)
                         continue;
 
                     if (!prepared)
                     {
                         RequireMigration(memory.PrepareDeviceChange());
-                        if (settings.KvVramBlocks != 0) RequireMigration(kv.PrepareDeviceChange());
+                        if (cache is not null && settings.KvVramBlocks != 0)
+                            RequireMigration(cache.PrepareDeviceChange());
                         previous.ZeroScratch();
                         execution.Release();
                         prepared = true;
@@ -252,13 +269,13 @@ internal sealed class PagedLlamaModel : IDisposable
                         continue;
                     }
                     targetLease = entered.Value!;
-                    if (!CanMigrate(targetPci)) continue;
+                    if (MigrationTargetHealth(targetPci) is not { } targetHealth) continue;
 
                     var targetCompute = new TransformerCompute(candidate);
                     RequireMigration(memory.BindPreparedDevice(candidate));
-                    if (settings.KvVramBlocks != 0)
+                    if (cache is not null && settings.KvVramBlocks != 0)
                     {
-                        var bound = kv.BindPreparedDevice(candidate);
+                        var bound = cache.BindPreparedDevice(candidate);
                         if (!bound.IsSuccess)
                         {
                             RequireMigration(memory.BindPreparedDevice(previous));
@@ -271,7 +288,7 @@ internal sealed class PagedLlamaModel : IDisposable
                     deviceOrdinal = ordinal;
                     compute = targetCompute;
                     weights.SetCompute(targetCompute);
-                    kv.SetCompute(targetCompute);
+                    cache?.SetCompute(targetCompute);
                     execution.Lease = targetLease;
                     targetLease = null;
                     accepted = true;
@@ -282,11 +299,13 @@ internal sealed class PagedLlamaModel : IDisposable
                     audit["gpu_migration_from_pci"] = previousPci;
                     audit["gpu_migration_to_pci"] = targetPci;
                     audit["gpu_migration_position"] = position.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                    audit["gpu_migration_layer"] = layer.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    audit["gpu_migration_phase"] = layer.HasValue ? "layer" : "admission";
+                    if (layer is { } completedLayer)
+                        audit["gpu_migration_layer"] = completedLayer.ToString(System.Globalization.CultureInfo.InvariantCulture);
                     audit["gpu_migration_after_generated_tokens"] = generatedTokens.ToString(System.Globalization.CultureInfo.InvariantCulture);
                     audit["cuda_device_ordinal"] = ordinal.ToString(System.Globalization.CultureInfo.InvariantCulture);
                     previous.Dispose();
-                    return;
+                    return targetHealth;
                 }
                 finally
                 {
@@ -295,17 +314,18 @@ internal sealed class PagedLlamaModel : IDisposable
                 }
             }
 
+            thermalPlacementUnavailable = true;
             throw new InferenceGovernanceException(new ErrorContext("No other permitted CUDA device meets the thermal and resource limits.",
                 "device_thermal_migration_unavailable", true) { FailureKind = FailureKind.FailClosed });
         }
 
-        bool CanMigrate(string targetPci)
+        DeviceHealthSnapshot? MigrationTargetHealth(string targetPci)
         {
             var health = CheckHealth(targetPci);
             return health.IsSuccess && Admission.Evaluate(request, budget with
             {
                 AvailableVramBytes = (long)Math.Min((ulong)configuredVram, health.Value.VramFreeBytes)
-            }).IsSuccess;
+            }).IsSuccess ? health.Value : null;
         }
         var decoder = Encoding.UTF8.GetDecoder();
         var gen2 = GC.CollectionCount(2);

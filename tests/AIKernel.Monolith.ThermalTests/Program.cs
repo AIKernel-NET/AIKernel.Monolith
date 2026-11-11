@@ -64,6 +64,44 @@ try
         unavailable.Audit.GetValueOrDefault("cuda_device_ordinal") == source.ToString(CultureInfo.InvariantCulture),
         "A request continued after every alternative became ineligible.");
 
+    var recoveryTelemetry = new ThermalSample(nvml, sourcePci);
+    var recoverySchedulers = new Dictionary<int, LayerQosScheduler> { [source] = new(), [destination] = new() };
+    using (var reused = new PagedLlamaModel(settings with { ThermalMigrationDevices = [source, destination] },
+        timeout.Token, recoveryTelemetry))
+    {
+        var failedAudit = new Dictionary<string, string>();
+        var pieces = 0;
+        try
+        {
+            await reused.GenerateAsync(prompt, _ =>
+            {
+                if (++pieces == 1) recoveryTelemetry.HotPci = sourcePci;
+                if (pieces == 2) recoveryTelemetry.HotPci = destinationPci;
+                return Task.CompletedTask;
+            }, failedAudit, null, timeout.Token, schedulerForDevice: ordinal => recoverySchedulers[ordinal]);
+            throw new InvalidOperationException("The setup request must fail when its second GPU overheats.");
+        }
+        catch (InferenceGovernanceException ex) when (ex.Error.Code == "device_thermal_migration_unavailable")
+        {
+            Check(pieces == 2 && failedAudit["gpu_migration_to_pci"] == destinationPci,
+                "The setup request did not fail on the second GPU.");
+        }
+
+        var recoveredAudit = new Dictionary<string, string>();
+        var recoveredText = new StringBuilder();
+        await reused.GenerateAsync(prompt, piece =>
+        {
+            recoveredText.Append(piece);
+            return Task.CompletedTask;
+        }, recoveredAudit, null, timeout.Token, schedulerForDevice: ordinal => recoverySchedulers[ordinal]);
+        Check(recoveredAudit["gpu_migration_phase"] == "admission" &&
+            recoveredAudit["gpu_migration_from_pci"] == destinationPci &&
+            recoveredAudit["gpu_migration_to_pci"] == sourcePci &&
+            recoveredAudit["local_forward_layers"] == baseline.Audit["local_forward_layers"] &&
+            recoveredText.ToString() == baseline.Text,
+            "The request after thermal failure did not start fresh on the cooler GPU.");
+    }
+
     using var output = new Utf8JsonWriter(Console.OpenStandardOutput(), new() { Indented = true });
     output.WriteStartObject();
     output.WriteString("source_pci", sourcePci);
@@ -129,6 +167,7 @@ sealed class ThermalSample(IDeviceHealthTelemetry nvml, string source) : IDevice
 {
     private int sourceReads;
     internal bool Armed { get; set; }
+    internal string? HotPci { get; set; }
     internal bool HeatAllWhenArmed { get; init; }
     internal int HeatOnSourceRead { get; init; } = int.MaxValue;
 
@@ -136,7 +175,8 @@ sealed class ThermalSample(IDeviceHealthTelemetry nvml, string source) : IDevice
     {
         var sample = nvml.Read(pciBusId);
         var isSource = string.Equals(pciBusId, source, StringComparison.OrdinalIgnoreCase);
-        if (sample.IsSuccess && (isSource && (++sourceReads >= HeatOnSourceRead || Armed) ||
+        if (sample.IsSuccess && (string.Equals(HotPci, pciBusId, StringComparison.OrdinalIgnoreCase) ||
+            isSource && (++sourceReads >= HeatOnSourceRead || Armed) ||
             Armed && HeatAllWhenArmed))
             return Result<DeviceHealthSnapshot>.Success(sample.Value with { TemperatureCelsius = 121 });
         return sample;

@@ -202,7 +202,10 @@ same CUDA device share a scheduler. A higher priority request can preempt
 a lower priority request at its next transformer layer checkpoint.
 The resource gate runs before the first forward pass. When required health
 telemetry is unavailable at initialization, the model uses CPU/RAM/SSD.
-A device above the temperature limit at admission is rejected. If a device
+A device above the temperature limit at admission is rejected unless the
+previous request on the model failed to find a thermal migration target.
+In that case, the next request can move the model to an eligible CUDA device
+before allocating its own KV cache and starting prefill. If a device
 crosses the limit after a layer, the request drains its resident pages to
 backing storage, releases its device lease, and continues with the same KV
 cache and activations on an eligible CUDA device. The destination must pass
