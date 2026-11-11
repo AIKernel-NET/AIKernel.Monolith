@@ -1,4 +1,5 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends cmake make gcc libc6-dev clang zlib1g-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src/AIKernel.Monolith
 COPY . .
 COPY --from=aikernel-providers Directory.Build.props /src/AIKernel.Providers/
@@ -7,7 +8,9 @@ COPY --from=aikernel-core Directory.Build.props /src/AIKernel.Core/
 COPY --from=aikernel-core src/AIKernel.Common /src/AIKernel.Core/src/AIKernel.Common
 COPY --from=aikernel-core src/AIKernel.Core /src/AIKernel.Core/src/AIKernel.Core
 COPY --from=aikernel-core src/AIKernel.Kernel /src/AIKernel.Core/src/AIKernel.Kernel
-RUN dotnet publish src/AIKernel.Monolith/AIKernel.Monolith.csproj -c Release -r linux-x64 --self-contained true -o /out /p:PublishAot=true /p:GeneratePackageOnBuild=false
+COPY --from=aikernel-core native/cuda /src/AIKernel.Core/native/cuda
+RUN cmake -S /src/AIKernel.Core/native/cuda -B /native-build -DCMAKE_BUILD_TYPE=Release && cmake --build /native-build
+RUN dotnet publish src/AIKernel.Monolith/AIKernel.Monolith.csproj -c Release -r linux-x64 --self-contained true -o /out /p:PublishAot=true /p:GeneratePackageOnBuild=false /p:AIKernelNativeComputeLibrary=/native-build/libaikernel_cuda_driver.so
 
 FROM mcr.microsoft.com/dotnet/runtime-deps:10.0
 WORKDIR /aikernel

@@ -112,10 +112,16 @@ completion requests, and an embedding registration only accepts embedding reques
 ### Local paged CUDA inference
 
 Register a `providers.paged-llama` chat model under the model mount. This
-provider accepts the legacy llama2.c little-endian FP32 checkpoint format
-and the matching binary tokenizer. It runs the Transformer in the host with
-CUDA matrix-vector multiplication over resident weight blocks. A 64-bit
-Windows or Linux host with an NVIDIA driver provides the device backend.
+provider accepts Llama GGUF v2/v3, Llama SafeTensors with a config.json, and
+legacy llama2.c FP32 checkpoints. GGUF and SafeTensors tensors are mapped
+read-only and faulted into the compute tier one block at a time. GGUF
+supports F32, F16, BF16, Q4_0, and MXFP4 tensor types. SafeTensors supports
+F32, F16, and BF16. The mapped formats support unscaled rotary embeddings.
+
+The Native C ABI runs GEMV, normalization, RoPE, SwiGLU, Softmax, and paged
+Attention on CUDA or the host. A CUDA context adds VRAM and page-locked RAM.
+A host without an available CUDA device uses RAM and SSD with the same
+inference pipeline. The CUDA backend needs the installed NVIDIA driver.
 
 ```json
 {
@@ -136,21 +142,32 @@ Windows or Linux host with an NVIDIA driver provides the device backend.
 }
 ```
 
-Asset paths are relative to the model mount. Model weights load on the first
-authorized request and stay cached until the host exits. Place the config
+Asset paths are relative to the model mount. GGUF can use embedded Llama
+vocabulary and scores. Set tokenizer to a matching legacy binary, Llama
+SentencePiece BPE model, or SentencePiece-style BPE tokenizer.json to load
+it separately. For SafeTensors set config to the matching config.json.
+Model state initializes on the first authorized request and stays cached
+until the host exits. Place the config
 mount on a private writable SSD directory for the swap files under
 `model-swap/`. Allow disk capacity for the model's nonresident blocks.
 `blockSize` is a power of two from 4 KiB to 32 MiB and must fit a matrix row.
 The defaults are 2 MiB per block, 32 RAM blocks, 32 VRAM blocks, CUDA device
 ordinal 0, a 512-token context, and at most 32 generated tokens. The weight
-budgets cover resident model blocks. The runtime also uses host KV cache
-and staging memory, a CUDA context, and device input/output buffers.
+budgets cover resident model blocks. The per-request KV address space uses
+64 KiB blocks (or larger if a row requires it), with separate kvRamBlocks
+and kvVramBlocks settings. Defaults are 32 RAM and 16 VRAM blocks for KV.
+The runtime also uses staging memory, a CUDA context, and device scratch
+buffers.
 
 The local model works with `/v1/completions` and `/v1/chat/completions`,
 including SSE. A single user message is used as a raw prompt. Multiple
-messages are formatted as role-prefixed lines. Tokens are selected greedily.
+messages are formatted as role-prefixed lines. Temperature defaults to zero
+for greedy selection. Set temperature above zero and topP in (0, 1] for
+nucleus sampling.
 The audit log records resident weight counts, swap reads, VRAM page-ins,
-and CUDA matrix blocks processed for each successful request.
+and matrix blocks processed for each successful request. Audit fields also
+include KV swap reads, process-wide Gen 2 collection deltas, allocated bytes,
+and the maximum observed generation step time.
 
 To exercise the published Windows x64 executable with the
 [TinyStories 260K model and tokenizer](https://huggingface.co/karpathy/tinyllamas/tree/0bd21da/stories260K),
@@ -158,7 +175,13 @@ put `stories260K.bin` and `tok512.bin` in the model asset directory and run:
 
 ```powershell
 python tests/native-aot-paged-llama.py <published-exe> <model-assets-directory> <report-directory> 0
+python tests/native-aot-standalone.py <published-exe> <model-assets-directory> <report-directory>
 ```
+
+Pass `--cpu-only` to the standalone test to check RAM/SSD generation in a
+Linux container without the NVIDIA driver. Pass `--oversized-device <ordinal>`
+to generate a sparse FP32 GGUF larger than that device and verify real CUDA
+page-ins during generation.
 
 ## Retrieval-Augmented Generation
 
@@ -262,6 +285,10 @@ docker build -f docker/Dockerfile.windows -t aikernel/monolith:windows .
 
 The base image contains the AOT-compiled monolith binary, entrypoint, and sample configuration. Linux and Windows images extend it with platform-specific native ABI layers.
 The native build uses the sibling AIKernel.Core and AIKernel.Providers checkouts.
+Build the C ABI library from AIKernel.Core/native/cuda with CMake and a C
+compiler, and set AIKernelNativeComputeLibrary to the resulting DLL or SO
+when publishing. Deploy the library beside the executable. The container
+build compiles and copies it automatically.
 Point `AIKernelKernelProject` and `ChatOpenAIProviderProject` at alternate source projects as needed.
 Package-based builds can set `AIKernelKernelPackageVersion` and `ChatOpenAIProviderPackageVersion`
 to versions with paged CUDA support and streaming/embedding support respectively.

@@ -3,18 +3,26 @@ using AIKernel.Kernel.Memory;
 
 namespace AIKernel.Monolith.Models.Local;
 
-internal sealed class PagedLlamaWeights
+internal sealed unsafe class PagedLlamaWeights : IDisposable
 {
     private readonly VirtualMemorySpace memory;
-    private readonly CudaVirtualMemoryDevice cuda;
-    private readonly byte[] staging;
+    private readonly TransformerCompute compute;
+    private readonly VirtualMemoryBlockOperation multiply;
+    private float* input;
+    private float* output;
+    private int columnCount;
+    private int rowOffset;
+    private int rowCount;
+    private byte* staging;
+    private Span<byte> Staging => new(staging, memory.BlockSize);
     private long cachedBlock = -1;
 
-    internal PagedLlamaWeights(VirtualMemorySpace memory, CudaVirtualMemoryDevice cuda)
+    internal PagedLlamaWeights(VirtualMemorySpace memory, TransformerCompute compute)
     {
         this.memory = memory;
-        this.cuda = cuda;
-        staging = new byte[memory.BlockSize];
+        this.compute = compute;
+        multiply = MultiplyBlock;
+        staging = (byte*)NativeMemory.Alloc((nuint)memory.BlockSize);
     }
 
     internal void Load(FileStream checkpoint, IEnumerable<WeightMatrix> matrices, CancellationToken token)
@@ -26,9 +34,9 @@ internal sealed class PagedLlamaWeights
             {
                 token.ThrowIfCancellationRequested();
                 var count = Math.Min(matrix.RowsPerBlock, matrix.Rows - row) * matrix.Columns * sizeof(float);
-                checkpoint.ReadExactly(staging.AsSpan(0, count));
-                staging.AsSpan(count).Clear();
-                memory.WriteBlock(matrix.FirstBlock + row / matrix.RowsPerBlock, staging);
+                checkpoint.ReadExactly(Staging.Slice(0, count));
+                Staging.Slice(count).Clear();
+                memory.WriteBlock(matrix.FirstBlock + row / matrix.RowsPerBlock, Staging);
             }
         }
     }
@@ -38,32 +46,61 @@ internal sealed class PagedLlamaWeights
         var block = matrix.FirstBlock + row / matrix.RowsPerBlock;
         if (cachedBlock != block)
         {
-            memory.ReadBlock(block, staging);
+            memory.ReadBlock(block, Staging);
             cachedBlock = block;
         }
 
-        return MemoryMarshal.Cast<byte, float>(staging)
+        return MemoryMarshal.Cast<byte, float>(Staging)
             .Slice((row % matrix.RowsPerBlock) * matrix.Columns, matrix.Columns);
     }
 
-    internal void Multiply(WeightMatrix matrix, float[] input, float[] output, CancellationToken token)
+    internal void Multiply(WeightMatrix matrix, ReadOnlySpan<float> vector, Span<float> result, CancellationToken token)
     {
-        for (var row = 0; row < matrix.Rows; row += matrix.RowsPerBlock)
+        if (vector.Length != matrix.Columns || result.Length != matrix.Rows)
         {
-            token.ThrowIfCancellationRequested();
-            var count = Math.Min(matrix.RowsPerBlock, matrix.Rows - row);
-            memory.UseDeviceBlock(matrix.FirstBlock + row / matrix.RowsPerBlock,
-                block => cuda.MultiplyRows(block, input, output.AsSpan(row, count)));
-            MatrixBlocks++;
+            throw new ArgumentException("Matrix dimensions do not match the input and output spans.");
         }
+
+        // The callback runs synchronously while both buffers are fixed.
+        fixed (float* x = vector, y = result)
+        {
+            input = x;
+            output = y;
+            columnCount = matrix.Columns;
+            try
+            {
+                for (var row = 0; row < matrix.Rows; row += matrix.RowsPerBlock)
+                {
+                    token.ThrowIfCancellationRequested();
+                    rowOffset = row;
+                    rowCount = Math.Min(matrix.RowsPerBlock, matrix.Rows - row);
+                    memory.UseComputeBlock(matrix.FirstBlock + row / matrix.RowsPerBlock, multiply);
+                    MatrixBlocks++;
+                }
+            }
+            finally
+            {
+                input = output = null;
+            }
+        }
+    }
+
+    private void MultiplyBlock(ReadOnlySpan<byte> host, AIKernel.Core.Memory.IVirtualMemoryDeviceBlock? device)
+        => compute.MultiplyRows(host, device, new ReadOnlySpan<float>(input, columnCount), new Span<float>(output + rowOffset, rowCount));
+
+    public void Dispose()
+    {
+        NativeMemory.Free(staging);
+        staging = null;
     }
 
     internal long MatrixBlocks { get; private set; }
 }
 
-internal sealed record WeightMatrix(int Rows, int Columns, int RowsPerBlock, long FirstBlock, long Offset);
+internal sealed record WeightMatrix(int Rows, int Columns, int RowsPerBlock, long FirstBlock, long Offset,
+    TensorEncoding Encoding = TensorEncoding.F32);
 internal sealed record LlamaLayer(WeightMatrix Query, WeightMatrix Key, WeightMatrix Value, WeightMatrix Output,
-    WeightMatrix Gate, WeightMatrix Down, WeightMatrix Up);
+    WeightMatrix Gate, WeightMatrix Down, WeightMatrix Up, WeightMatrix AttentionNorm, WeightMatrix FeedForwardNorm, int NormRow);
 
 internal sealed class LlamaCheckpoint
 {
@@ -75,10 +112,11 @@ internal sealed class LlamaCheckpoint
     internal int KvDimension => KvHeads * HeadSize;
     internal int Vocabulary { get; }
     internal int Context { get; }
+    internal float RopeBase { get; } = 10000;
+    internal float Epsilon { get; } = 1e-5f;
+    internal bool SplitRope { get; }
     internal long BlockCount { get; }
     internal WeightMatrix Embedding { get; }
-    internal WeightMatrix AttentionNorm { get; }
-    internal WeightMatrix FeedForwardNorm { get; }
     internal WeightMatrix FinalNorm { get; }
     internal WeightMatrix Classifier { get; }
     internal LlamaLayer[] Layers { get; }
@@ -119,12 +157,12 @@ internal sealed class LlamaCheckpoint
         var offset = file.Position;
         long block = 0;
         Embedding = Reserve(Vocabulary, Dimension);
-        AttentionNorm = Reserve(layers, Dimension);
+        var attentionNorm = Reserve(layers, Dimension);
         var queries = ReserveLayers(Dimension, Dimension);
         var keys = ReserveLayers(KvDimension, Dimension);
         var values = ReserveLayers(KvDimension, Dimension);
         var outputs = ReserveLayers(Dimension, Dimension);
-        FeedForwardNorm = Reserve(layers, Dimension);
+        var feedForwardNorm = Reserve(layers, Dimension);
         var gates = ReserveLayers(HiddenDimension, Dimension);
         var downs = ReserveLayers(Dimension, HiddenDimension);
         var ups = ReserveLayers(HiddenDimension, Dimension);
@@ -141,7 +179,7 @@ internal sealed class LlamaCheckpoint
         for (var layer = 0; layer < layers; layer++)
         {
             Layers[layer] = new(queries[layer], keys[layer], values[layer], outputs[layer],
-                gates[layer], downs[layer], ups[layer]);
+                gates[layer], downs[layer], ups[layer], attentionNorm, feedForwardNorm, layer);
         }
 
         WeightMatrix Reserve(int rows, int columns)
@@ -157,4 +195,71 @@ internal sealed class LlamaCheckpoint
         WeightMatrix[] ReserveLayers(int rows, int columns)
             => Enumerable.Range(0, layers).Select(_ => Reserve(rows, columns)).ToArray();
     }
+
+    internal LlamaCheckpoint(MappedModelFile file, int blockSize, int contextLimit)
+    {
+        var dims = file.Dimensions;
+        Dimension = dims.Width;
+        HiddenDimension = dims.Hidden;
+        Heads = dims.Heads;
+        KvHeads = dims.KvHeads;
+        Vocabulary = dims.Vocab;
+        RopeBase = dims.RopeBase;
+        Epsilon = dims.Epsilon;
+        SplitRope = dims.SplitRope;
+        Context = Math.Min(dims.Context, contextLimit);
+        if (Dimension is < 2 or > 8192 || HiddenDimension is < 1 or > 65536 ||
+            dims.Layers is < 1 or > 96 || Heads is < 1 or > 128 || KvHeads < 1 || KvHeads > Heads ||
+            Dimension % Heads != 0 || Heads % KvHeads != 0 || HeadSize % 2 != 0 ||
+            Vocabulary is < 4 or > 200000 || Context < 2 || !float.IsFinite(RopeBase) || RopeBase <= 0 ||
+            !float.IsFinite(Epsilon) || Epsilon <= 0 || Math.Max(Dimension, HiddenDimension) > blockSize / 4)
+        {
+            throw new InvalidDataException("Invalid Llama model shape or block size.");
+        }
+
+        long block = 0;
+        Embedding = Reserve(file.Gguf ? "token_embd.weight" : "model.embed_tokens.weight", Vocabulary, Dimension);
+        Layers = new LlamaLayer[dims.Layers];
+        for (var layer = 0; layer < Layers.Length; layer++)
+        {
+            var prefix = file.Gguf ? $"blk.{layer}." : $"model.layers.{layer}.";
+            Layers[layer] = new(
+                Reserve(prefix + (file.Gguf ? "attn_q.weight" : "self_attn.q_proj.weight"), Dimension, Dimension),
+                Reserve(prefix + (file.Gguf ? "attn_k.weight" : "self_attn.k_proj.weight"), KvDimension, Dimension),
+                Reserve(prefix + (file.Gguf ? "attn_v.weight" : "self_attn.v_proj.weight"), KvDimension, Dimension),
+                Reserve(prefix + (file.Gguf ? "attn_output.weight" : "self_attn.o_proj.weight"), Dimension, Dimension),
+                Reserve(prefix + (file.Gguf ? "ffn_gate.weight" : "mlp.gate_proj.weight"), HiddenDimension, Dimension),
+                Reserve(prefix + (file.Gguf ? "ffn_down.weight" : "mlp.down_proj.weight"), Dimension, HiddenDimension),
+                Reserve(prefix + (file.Gguf ? "ffn_up.weight" : "mlp.up_proj.weight"), HiddenDimension, Dimension),
+                Reserve(prefix + (file.Gguf ? "attn_norm.weight" : "input_layernorm.weight"), 1, Dimension),
+                Reserve(prefix + (file.Gguf ? "ffn_norm.weight" : "post_attention_layernorm.weight"), 1, Dimension), 0);
+        }
+
+        FinalNorm = Reserve(file.Gguf ? "output_norm.weight" : "model.norm.weight", 1, Dimension);
+        var output = file.Gguf ? "output.weight" : "lm_head.weight";
+        Classifier = file.Contains(output) ? Reserve(output, Vocabulary, Dimension) : Embedding;
+        BlockCount = block;
+
+        var ordered = Matrices.OrderBy(matrix => matrix.Offset).ToArray();
+        for (var i = 1; i < ordered.Length; i++)
+        {
+            var previous = ordered[i - 1];
+            if (previous.Offset + (long)previous.Rows * MappedModelFile.RowBytes(previous.Encoding, previous.Columns)
+                > ordered[i].Offset)
+            {
+                throw new InvalidDataException("Mapped model tensors overlap.");
+            }
+        }
+
+        WeightMatrix Reserve(string name, int rows, int cols)
+        {
+            var tensor = file.Require(name, rows, cols);
+            var perBlock = blockSize / (cols * sizeof(float));
+            var matrix = new WeightMatrix(rows, cols, perBlock, block, tensor.Offset, tensor.Encoding);
+            block += (rows + (long)perBlock - 1) / perBlock;
+            Matrices.Add(matrix);
+            return matrix;
+        }
+    }
+
 }

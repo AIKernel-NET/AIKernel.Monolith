@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using AIKernel.Abstractions.Events;
+using AIKernel.Common.Results;
 using AIKernel.Abstractions.Governance;
 using AIKernel.Dtos.Events;
 using AIKernel.Dtos.Governance;
@@ -38,12 +39,14 @@ internal sealed class GovernedModelInference(
             }, cancellationToken, async (settings, metadata, token) =>
             {
                 var text = new StringBuilder();
-                var finishReason = await localModels.GenerateAsync(modelId!, settings, messages!, chunk =>
+                var result = await localModels.GenerateAsync(modelId!, settings, messages!, chunk =>
                 {
                     text.Append(chunk);
                     return Task.CompletedTask;
                 }, metadata, token);
-                return text.Length == 0 ? null : new ModelCompletion(id, text.ToString()) { FinishReason = finishReason };
+                return result.Bind(finish => text.Length == 0
+                    ? Result<ModelCompletion>.Fail(new ErrorContext("Empty local model response.", "provider_error", false))
+                    : Result<ModelCompletion>.Success(new ModelCompletion(id, text.ToString()) { FinishReason = finish }));
             });
     }
 
@@ -89,7 +92,7 @@ internal sealed class GovernedModelInference(
         string? completionId,
         Func<ChatOpenAIProvider, CancellationToken, Task<T?>> execute,
         CancellationToken cancellationToken,
-        Func<PagedLlamaSettings, Dictionary<string, string>, CancellationToken, Task<T?>>? executeLocal = null) where T : class
+        Func<PagedLlamaSettings, Dictionary<string, string>, CancellationToken, Task<Result<T>>>? executeLocal = null) where T : class
     {
         var model = modelId is null ? null : registry.Find(modelId);
         var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -151,7 +154,19 @@ internal sealed class GovernedModelInference(
             T? value;
             if (model.Local is { } local)
             {
-                value = await executeLocal!(local, metadata, cancellationToken);
+                var result = await executeLocal!(local, metadata, cancellationToken);
+                if (result.IsFailure)
+                {
+                    var error = result.Error!;
+                    if (error.Code == "context_length_exceeded")
+                        return await RejectAsync(InferenceErrors.ContextLengthExceeded);
+
+                    metadata["local_error"] = error.Code;
+                    logger.LogWarning("Local inference failed for request {RequestId}: {Failure}", requestId, error.Message);
+                    return await ProviderFailedAsync(error.Code);
+                }
+
+                value = result.Value;
             }
             else
             {
@@ -180,15 +195,6 @@ internal sealed class GovernedModelInference(
                 ? new(Value: value)
                 : new(Error: InferenceErrors.AuditUnavailable);
         }
-        catch (LocalContextLengthException)
-        {
-            return await RejectAsync(InferenceErrors.ContextLengthExceeded);
-        }
-        catch (LocalModelException ex)
-        {
-            logger.LogWarning(ex.InnerException, "Local inference failed for request {RequestId}", requestId);
-            return await ProviderFailedAsync("provider_error");
-        }
         catch (Exception ex) when (ex is HttpRequestException or JsonException or InvalidDataException
             or IOException or OperationCanceledException)
         {
@@ -208,7 +214,12 @@ internal sealed class GovernedModelInference(
 
         async Task<InferenceOutcome<T>> ProviderFailedAsync(string reason)
             => await RecordAsync("inference.execution", reason, AuditSeverity.Error)
-                ? new(Error: InferenceErrors.ProviderFailed)
+                ? new(Error: reason switch
+                {
+                    "unsupported_model_format" => InferenceErrors.UnsupportedLocalModel,
+                    "local_memory_exhausted" => InferenceErrors.LocalMemoryExhausted,
+                    _ => InferenceErrors.ProviderFailed
+                })
                 : new(Error: InferenceErrors.AuditUnavailable);
 
         async ValueTask<bool> RecordAsync(string type, string outcome, AuditSeverity severity)
@@ -238,6 +249,10 @@ internal static class InferenceErrors
         new(400, "invalid_request", "A model ID and valid text messages are required.");
     internal static readonly InferenceError ContextLengthExceeded =
         new(400, "context_length_exceeded", "The prompt exceeds the configured local model context.");
+    internal static readonly InferenceError UnsupportedLocalModel =
+        new(422, "unsupported_model_format", "The local model format or encoding is unsupported.");
+    internal static readonly InferenceError LocalMemoryExhausted =
+        new(503, "local_memory_exhausted", "The local model could not allocate memory.");
     internal static readonly InferenceError InvalidEmbeddingRequest =
         new(400, "invalid_request", "Provide one to 2048 non-empty texts and use float encoding.");
     internal static readonly InferenceError ModelNotFound =

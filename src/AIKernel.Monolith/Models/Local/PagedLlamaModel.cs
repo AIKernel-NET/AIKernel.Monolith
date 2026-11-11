@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 using AIKernel.Kernel.Memory;
 using AIKernel.Monolith.OpenAI;
@@ -6,41 +8,74 @@ namespace AIKernel.Monolith.Models.Local;
 
 internal sealed class PagedLlamaModel : IDisposable
 {
-    private readonly CudaVirtualMemoryDevice cuda;
+    private readonly CudaVirtualMemoryDevice? cuda;
+    private readonly TransformerCompute compute;
+    private readonly PagedLlamaSettings settings;
+    private readonly int cudaStatus;
     private readonly VirtualMemorySpace memory;
     private readonly PagedLlamaWeights weights;
     private readonly LlamaCheckpoint shape;
     private readonly LlamaTokenizer tokenizer;
     private readonly int maxNewTokens;
     private readonly long checkpointBytes;
+    private readonly MappedModelFile? mapped;
 
     internal PagedLlamaModel(PagedLlamaSettings settings, CancellationToken token)
     {
-        using var file = new FileStream(settings.Checkpoint, FileMode.Open, FileAccess.Read, FileShare.Read);
-        checkpointBytes = file.Length;
-        shape = new LlamaCheckpoint(file, settings.BlockSize, settings.ContextTokens);
-        tokenizer = new LlamaTokenizer(settings.Tokenizer, shape.Vocabulary);
-        maxNewTokens = settings.MaxNewTokens;
-        Directory.CreateDirectory(settings.SwapDirectory);
-        cuda = new CudaVirtualMemoryDevice(settings.Device);
+        this.settings = settings;
+        var extension = Path.GetExtension(settings.Checkpoint);
+        var isMapped = extension.Equals(".gguf", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".safetensors", StringComparison.OrdinalIgnoreCase);
+        using var legacy = isMapped ? null : File.OpenRead(settings.Checkpoint);
+        mapped = isMapped ? new MappedModelFile(settings.Checkpoint, settings.Config) : null;
         try
         {
-            memory = new VirtualMemorySpace(shape.BlockCount, settings.BlockSize, settings.RamBlocks,
-                settings.SwapDirectory, settings.VramBlocks, cuda);
+            checkpointBytes = mapped?.Length ?? legacy!.Length;
+            shape = mapped is null ? new LlamaCheckpoint(legacy!, settings.BlockSize, settings.ContextTokens)
+                : new LlamaCheckpoint(mapped, settings.BlockSize, settings.ContextTokens);
+            tokenizer = settings.Tokenizer is { } tokenizerPath
+                ? new LlamaTokenizer(tokenizerPath, shape.Vocabulary)
+                : LlamaTokenizer.FromEmbedded(mapped, shape.Vocabulary);
+            maxNewTokens = settings.MaxNewTokens;
+            Directory.CreateDirectory(settings.SwapDirectory);
+            cuda = CudaVirtualMemoryDevice.TryCreate(settings.Device, out cudaStatus);
+            compute = new TransformerCompute(cuda);
             try
             {
-                weights = new PagedLlamaWeights(memory, cuda);
-                weights.Load(file, shape.Matrices, token);
+                var source = mapped is null ? null : new MappedTensorSource(mapped, shape.Matrices.ToArray());
+                memory = new VirtualMemorySpace(shape.BlockCount, settings.BlockSize, settings.RamBlocks,
+                    settings.SwapDirectory, cuda is null ? 0 : settings.VramBlocks, cuda, source);
+                try
+                {
+                    weights = new PagedLlamaWeights(memory, compute);
+                    try
+                    {
+                        if (legacy is not null)
+                        {
+                            weights.Load(legacy, shape.Matrices, token);
+                        }
+                    }
+                    catch
+                    {
+                        weights.Dispose();
+                        throw;
+                    }
+                }
+                catch
+                {
+                    memory.Dispose();
+                    throw;
+                }
             }
             catch
             {
-                memory.Dispose();
+                cuda?.Dispose();
                 throw;
             }
         }
         catch
         {
-            cuda.Dispose();
+            mapped?.Dispose();
             throw;
         }
     }
@@ -57,8 +92,12 @@ internal sealed class PagedLlamaModel : IDisposable
 
         var initial = memory.GetStatistics();
         var matrixBlocks = weights.MatrixBlocks;
-        var state = new ForwardState(shape, weights);
+        using var kv = new PagedKvCache(shape, settings, cuda, compute);
+        using var state = new ForwardState(shape, weights, compute, kv, settings);
         var decoder = Encoding.UTF8.GetDecoder();
+        var gen2 = GC.CollectionCount(2);
+        var allocated = GC.GetTotalAllocatedBytes(precise: false);
+        long maxStepTicks = 0;
         for (var pos = 0; pos < tokens.Count - 1; pos++)
         {
             state.Forward(tokens[pos], pos, token);
@@ -69,8 +108,10 @@ internal sealed class PagedLlamaModel : IDisposable
         var finish = "length";
         for (var step = 0; step < maxNewTokens && position < shape.Context; step++, position++)
         {
+            var stepStarted = Stopwatch.GetTimestamp();
             state.Forward(current, position, token);
             var next = state.Predict(token);
+            maxStepTicks = Math.Max(maxStepTicks, Stopwatch.GetTimestamp() - stepStarted);
             if (next is LlamaTokenizer.Begin or LlamaTokenizer.End)
             {
                 finish = "stop";
@@ -100,19 +141,32 @@ internal sealed class PagedLlamaModel : IDisposable
         audit["weight_swap_blocks"] = initial.SwapBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
         audit["weight_swap_reads"] = (final.SwapReads - initial.SwapReads).ToString(System.Globalization.CultureInfo.InvariantCulture);
         audit["weight_vram_page_ins"] = (final.DevicePageIns - initial.DevicePageIns).ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["cuda_matvec_blocks"] = (weights.MatrixBlocks - matrixBlocks).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        audit["backend"] = cuda is null ? "cpu" : "cuda";
+        audit["cuda_status"] = cudaStatus.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        audit[cuda is null ? "cpu_matvec_blocks" : "cuda_matvec_blocks"] =
+            (weights.MatrixBlocks - matrixBlocks).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        audit["mapped_weight_reads"] = (final.BackingReads - initial.BackingReads).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        audit["kv_swap_reads"] = kv.Statistics.SwapReads.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        audit["kv_vram_page_ins"] = kv.Statistics.DevicePageIns.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        audit["generation_gen2_collections"] = (GC.CollectionCount(2) - gen2).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        audit["generation_allocated_bytes"] = (GC.GetTotalAllocatedBytes(precise: false) - allocated)
+            .ToString(System.Globalization.CultureInfo.InvariantCulture);
+        audit["generation_max_step_us"] = ((long)(maxStepTicks * (1_000_000d / Stopwatch.Frequency)))
+            .ToString(System.Globalization.CultureInfo.InvariantCulture);
         return finish;
     }
 
     public void Dispose()
     {
+        weights.Dispose();
         try
         {
             memory.Dispose();
         }
         finally
         {
-            cuda.Dispose();
+            try { cuda?.Dispose(); }
+            finally { mapped?.Dispose(); }
         }
     }
 
@@ -128,7 +182,7 @@ internal sealed class PagedLlamaModel : IDisposable
             : string.Join('\n', messages.Select(message => $"{message.Role}: {message.Content}")) + "\nassistant:";
     }
 
-    private sealed class ForwardState(LlamaCheckpoint shape, PagedLlamaWeights weights)
+    private sealed unsafe class ForwardState(LlamaCheckpoint shape, PagedLlamaWeights weights, TransformerCompute compute, PagedKvCache kv, PagedLlamaSettings settings) : IDisposable
     {
         private readonly float[] activation = new float[shape.Dimension];
         private readonly float[] normalized = new float[shape.Dimension];
@@ -137,14 +191,20 @@ internal sealed class PagedLlamaModel : IDisposable
         private readonly float[] value = new float[shape.KvDimension];
         private readonly float[] attended = new float[shape.Dimension];
         private readonly float[] projected = new float[shape.Dimension];
-        private readonly float[] gate = new float[shape.HiddenDimension];
-        private readonly float[] up = new float[shape.HiddenDimension];
-        private readonly float[] logits = new float[shape.Vocabulary];
-        private readonly float[] scores = new float[shape.Context];
-        private readonly float[][] keys = shape.Layers.Select(_ => new float[shape.Context * shape.KvDimension]).ToArray();
-        private readonly float[][] values = shape.Layers.Select(_ => new float[shape.Context * shape.KvDimension]).ToArray();
+        private readonly float[] sinCos = new float[shape.Dimension];
+        private readonly float[] rotation = new float[shape.Dimension];
         private readonly float[] rope = Enumerable.Range(0, shape.HeadSize / 2)
-            .Select(pair => MathF.Pow(10000, -2f * pair / shape.HeadSize)).ToArray();
+            .Select(pair => MathF.Pow(shape.RopeBase, -2f * pair / shape.HeadSize)).ToArray();
+        // Feed-forward and vocabulary buffers can each exceed the managed LOH threshold.
+        private readonly float* scratch = (float*)NativeMemory.Alloc(
+            (nuint)(2 * shape.HiddenDimension + 2 * shape.Vocabulary), sizeof(float));
+
+        private Span<float> Gate => new(scratch, shape.HiddenDimension);
+        private Span<float> Up => new(scratch + shape.HiddenDimension, shape.HiddenDimension);
+        private Span<float> Logits => new(scratch + 2 * shape.HiddenDimension, shape.Vocabulary);
+        private Span<int> SampleIndices => new(scratch + 2 * shape.HiddenDimension + shape.Vocabulary, shape.Vocabulary);
+
+        public void Dispose() => NativeMemory.Free(scratch);
 
         internal void Forward(int tokenId, int position, CancellationToken token)
         {
@@ -152,25 +212,23 @@ internal sealed class PagedLlamaModel : IDisposable
             for (var index = 0; index < shape.Layers.Length; index++)
             {
                 var layer = shape.Layers[index];
-                Normalize(weights.ReadRow(shape.AttentionNorm, index));
+                Normalize(weights.ReadRow(layer.AttentionNorm, layer.NormRow));
                 weights.Multiply(layer.Query, normalized, query, token);
                 weights.Multiply(layer.Key, normalized, key, token);
                 weights.Multiply(layer.Value, normalized, value, token);
                 Rotate(query, position);
                 Rotate(key, position);
-                key.CopyTo(keys[index], position * shape.KvDimension);
-                value.CopyTo(values[index], position * shape.KvDimension);
-                Attend(index, position);
+                kv.Write(index, position, key, value);
+                Attend(index, position, token);
                 weights.Multiply(layer.Output, attended, projected, token);
                 AddResidual();
 
-                Normalize(weights.ReadRow(shape.FeedForwardNorm, index));
+                Normalize(weights.ReadRow(layer.FeedForwardNorm, layer.NormRow));
+                var gate = Gate;
+                var up = Up;
                 weights.Multiply(layer.Gate, normalized, gate, token);
                 weights.Multiply(layer.Up, normalized, up, token);
-                for (var i = 0; i < gate.Length; i++)
-                {
-                    gate[i] = gate[i] / (1f + MathF.Exp(-gate[i])) * up[i];
-                }
+                compute.SwiGlu(gate, up);
 
                 weights.Multiply(layer.Down, gate, projected, token);
                 AddResidual();
@@ -180,6 +238,7 @@ internal sealed class PagedLlamaModel : IDisposable
         internal int Predict(CancellationToken token)
         {
             Normalize(weights.ReadRow(shape.FinalNorm, 0));
+            var logits = Logits;
             weights.Multiply(shape.Classifier, normalized, logits, token);
             var best = 0;
             for (var i = 0; i < logits.Length; i++)
@@ -195,76 +254,88 @@ internal sealed class PagedLlamaModel : IDisposable
                 }
             }
 
-            return best;
+            if (settings.Temperature == 0)
+            {
+                return best;
+            }
+
+            var maximum = logits[best];
+            var sampleIndices = SampleIndices;
+            for (var i = 0; i < logits.Length; i++)
+            {
+                logits[i] = (logits[i] - maximum) / settings.Temperature;
+                sampleIndices[i] = i;
+            }
+
+            compute.Softmax(logits);
+            logits.Sort(sampleIndices);
+            var cutoff = logits.Length - 1;
+            var mass = logits[cutoff];
+            while (cutoff > 0 && mass < settings.TopP)
+            {
+                mass += logits[--cutoff];
+            }
+
+            var draw = Random.Shared.NextSingle() * mass;
+            for (var i = logits.Length - 1; i >= cutoff; i--)
+            {
+                draw -= logits[i];
+                if (draw <= 0) return sampleIndices[i];
+            }
+
+            return sampleIndices[cutoff];
         }
 
         private void Normalize(ReadOnlySpan<float> scale)
-        {
-            var norm = 0f;
-            foreach (var component in activation)
-            {
-                norm += component * component;
-            }
-
-            var inverse = 1f / MathF.Sqrt(norm / activation.Length + 1e-5f);
-            for (var i = 0; i < activation.Length; i++)
-            {
-                normalized[i] = activation[i] * inverse * scale[i];
-            }
-        }
+            => compute.Normalize(activation, scale, normalized, shape.Epsilon);
 
         private void Rotate(Span<float> vector, int position)
         {
+            var coefficients = sinCos.AsSpan(0, vector.Length);
             for (var i = 0; i < vector.Length; i += 2)
             {
                 var (sin, cos) = MathF.SinCos(position * rope[(i % shape.HeadSize) / 2]);
-                var first = vector[i];
-                var second = vector[i + 1];
-                vector[i] = first * cos - second * sin;
-                vector[i + 1] = first * sin + second * cos;
+                coefficients[i] = sin;
+                coefficients[i + 1] = cos;
+            }
+
+            if (!shape.SplitRope)
+            {
+                compute.Rope(vector, coefficients);
+                return;
+            }
+
+            var pairs = rotation.AsSpan(0, vector.Length);
+            var half = shape.HeadSize / 2;
+            for (var start = 0; start < vector.Length; start += shape.HeadSize)
+            {
+                for (var i = 0; i < half; i++)
+                {
+                    pairs[start + 2 * i] = vector[start + i];
+                    pairs[start + 2 * i + 1] = vector[start + half + i];
+                }
+            }
+
+            compute.Rope(pairs, coefficients);
+            for (var start = 0; start < vector.Length; start += shape.HeadSize)
+            {
+                for (var i = 0; i < half; i++)
+                {
+                    vector[start + i] = pairs[start + 2 * i];
+                    vector[start + half + i] = pairs[start + 2 * i + 1];
+                }
             }
         }
 
-        private void Attend(int layer, int position)
+        private void Attend(int layer, int position, CancellationToken token)
         {
             var width = shape.HeadSize;
-            var scale = 1f / MathF.Sqrt(width);
             for (var head = 0; head < shape.Heads; head++)
             {
                 var queryOffset = head * width;
                 var kvOffset = head / (shape.Heads / shape.KvHeads) * width;
-                var max = float.NegativeInfinity;
-                for (var t = 0; t <= position; t++)
-                {
-                    var dot = 0f;
-                    var offset = t * shape.KvDimension + kvOffset;
-                    for (var j = 0; j < width; j++)
-                    {
-                        dot += query[queryOffset + j] * keys[layer][offset + j];
-                    }
-
-                    scores[t] = dot * scale;
-                    max = MathF.Max(max, scores[t]);
-                }
-
-                var sum = 0f;
-                for (var t = 0; t <= position; t++)
-                {
-                    scores[t] = MathF.Exp(scores[t] - max);
-                    sum += scores[t];
-                }
-
-                var target = attended.AsSpan(queryOffset, width);
-                target.Clear();
-                for (var t = 0; t <= position; t++)
-                {
-                    var coefficient = scores[t] / sum;
-                    var offset = t * shape.KvDimension + kvOffset;
-                    for (var j = 0; j < width; j++)
-                    {
-                        target[j] += coefficient * values[layer][offset + j];
-                    }
-                }
+                kv.Attend(layer, position, kvOffset, query.AsSpan(queryOffset, width),
+                    attended.AsSpan(queryOffset, width), token);
             }
         }
 

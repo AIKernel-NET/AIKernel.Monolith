@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.Text.Json;
 using System.Text.Json.Serialization;
+using AIKernel.Common.Results;
 using AIKernel.Monolith.OpenAI;
 
 namespace AIKernel.Monolith.Models.Local;
@@ -8,7 +10,7 @@ internal sealed class PagedLlamaPool : IDisposable
 {
     private readonly ConcurrentDictionary<string, Session> sessions = new(StringComparer.Ordinal);
 
-    internal async Task<string> GenerateAsync(string id, PagedLlamaSettings settings, IReadOnlyList<ChatMessage> messages,
+    internal async Task<Result<string>> GenerateAsync(string id, PagedLlamaSettings settings, IReadOnlyList<ChatMessage> messages,
         Func<string, Task> emit, Dictionary<string, string> audit, CancellationToken token)
     {
         var session = sessions.GetOrAdd(id, static _ => new Session());
@@ -16,13 +18,26 @@ internal sealed class PagedLlamaPool : IDisposable
         try
         {
             session.Model ??= new PagedLlamaModel(settings, token);
-            return await session.Model.GenerateAsync(messages, emit, audit, token);
+            return Result<string>.Success(await session.Model.GenerateAsync(messages, emit, audit, token));
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException
             or InvalidOperationException or DllNotFoundException or EntryPointNotFoundException
-            or NotSupportedException or OutOfMemoryException or System.Text.DecoderFallbackException)
+            or NotSupportedException or OutOfMemoryException or System.Text.DecoderFallbackException or ArgumentException
+            or JsonException or KeyNotFoundException or OverflowException or FormatException or AggregateException
+            or UnsupportedModelException or LocalContextLengthException)
         {
-            throw new LocalModelException(ex);
+            var code = ex switch
+            {
+                LocalContextLengthException => "context_length_exceeded",
+                UnsupportedModelException => "unsupported_model_format",
+                OutOfMemoryException => "local_memory_exhausted",
+                _ => "provider_error"
+            };
+            return Result<string>.Fail(new ErrorContext(ex.Message, code, false)
+            {
+                FailureKind = FailureKind.FailClosed,
+                OriginStep = OriginStep.Provider
+            });
         }
         finally
         {
@@ -52,17 +67,21 @@ internal sealed class PagedLlamaPool : IDisposable
     }
 }
 
-internal sealed record PagedLlamaSettings(string Checkpoint, string Tokenizer, string SwapDirectory,
-    int BlockSize, int RamBlocks, int VramBlocks, int Device, int ContextTokens, int MaxNewTokens);
+internal sealed record PagedLlamaSettings(string Checkpoint, string? Tokenizer, string? Config, string SwapDirectory,
+    int BlockSize, int RamBlocks, int VramBlocks, int Device, int ContextTokens, int MaxNewTokens,
+    int KvRamBlocks, int KvVramBlocks, float Temperature, float TopP);
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 internal sealed record PagedLlamaRegistration([property: JsonPropertyName("checkpoint")] string? Checkpoint,
     [property: JsonPropertyName("tokenizer")] string? Tokenizer,
+    [property: JsonPropertyName("config")] string? Config,
     [property: JsonPropertyName("blockSize")] int? BlockSize,
     [property: JsonPropertyName("ramBlocks")] int? RamBlocks,
     [property: JsonPropertyName("vramBlocks")] int? VramBlocks,
     [property: JsonPropertyName("device")] int? Device,
     [property: JsonPropertyName("contextTokens")] int? ContextTokens,
-    [property: JsonPropertyName("maxNewTokens")] int? MaxNewTokens);
-
-internal sealed class LocalModelException(Exception inner) : Exception("Local model execution failed.", inner);
+    [property: JsonPropertyName("maxNewTokens")] int? MaxNewTokens,
+    [property: JsonPropertyName("kvRamBlocks")] int? KvRamBlocks,
+    [property: JsonPropertyName("kvVramBlocks")] int? KvVramBlocks,
+    [property: JsonPropertyName("temperature")] float? Temperature,
+    [property: JsonPropertyName("topP")] float? TopP);

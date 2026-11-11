@@ -20,22 +20,28 @@ public sealed class ModelProviderRegistry
 
     public ModelProviderRegistry(MountOptions mountOptions)
     {
+        List<(string Path, JsonException Error)> invalidJson = [];
         foreach (var path in Directory.EnumerateFiles(mountOptions.ModelRoot, "*.json", SearchOption.AllDirectories)
                      .Order(StringComparer.Ordinal))
         {
-            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            using var document = ReadModelMountJson(path, invalidJson);
+            if (document is null) continue;
             var root = document.RootElement;
-            var registrations = root.ValueKind == JsonValueKind.Array
-                ? root.Deserialize(InferenceJsonContext.Default.ModelRegistrationArray)
-                : [root.Deserialize(InferenceJsonContext.Default.ModelRegistration)];
-
-            foreach (var registration in registrations ?? [])
+            // Model mounts may also contain tokenizer and architecture metadata.
+            IEnumerable<JsonElement> candidates = root.ValueKind == JsonValueKind.Array
+                ? root.EnumerateArray()
+                : [root];
+            foreach (var candidate in candidates)
             {
-                if (registration?.Provider is not (ChatOpenAIProviderId or PagedLlamaProviderId))
+                if (candidate.ValueKind != JsonValueKind.Object ||
+                    !candidate.TryGetProperty("provider", out var provider) ||
+                    provider.ValueKind != JsonValueKind.String ||
+                    provider.GetString() is not (ChatOpenAIProviderId or PagedLlamaProviderId))
                 {
                     continue;
                 }
 
+                var registration = candidate.Deserialize(InferenceJsonContext.Default.ModelRegistration)!;
                 var model = registration.Provider == PagedLlamaProviderId
                     ? CreateLocalModel(registration, mountOptions, path)
                     : CreateModel(registration, path);
@@ -44,6 +50,38 @@ public sealed class ModelProviderRegistry
                     throw new InvalidDataException($"Duplicate model ID '{model.Metadata.Id}' in '{path}'.");
                 }
             }
+        }
+
+        // Corrupt model assets fail at the provider boundary. Invalid registration files fail at startup.
+        if (invalidJson.Count > 0)
+        {
+            var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+            var assets = new HashSet<string>(comparer);
+            foreach (var model in models.Values)
+            {
+                if (model.Local?.Tokenizer is { } tokenizer) assets.Add(tokenizer);
+                if (model.Local?.Config is { } config) assets.Add(config);
+            }
+
+            foreach (var (path, error) in invalidJson)
+            {
+                if (!assets.Contains(Path.GetFullPath(path)))
+                    throw new InvalidDataException($"Invalid model registration JSON in '{path}'.", error);
+            }
+        }
+    }
+
+    private static JsonDocument? ReadModelMountJson(string path, List<(string Path, JsonException Error)> invalidJson)
+    {
+        using var file = File.OpenRead(path);
+        try
+        {
+            return JsonDocument.Parse(file);
+        }
+        catch (JsonException error)
+        {
+            invalidJson.Add((path, error));
+            return null;
         }
     }
 
@@ -92,19 +130,26 @@ public sealed class ModelProviderRegistry
         var context = config?.ContextTokens ?? 512;
         var maxNew = config?.MaxNewTokens ?? 32;
         var device = config?.Device ?? 0;
+        var kvRam = config?.KvRamBlocks ?? 32;
+        var kvVram = config?.KvVramBlocks ?? 16;
+        var temperature = config?.Temperature ?? 0;
+        var topP = config?.TopP ?? 1;
         if (string.IsNullOrWhiteSpace(registration.Id) || registration.Kind is not (null or "chat") ||
             registration.Endpoint is not null || registration.ApiKeyEnvironmentVariable is not null ||
             config is null || blockSize is < 4096 or > 32 * 1024 * 1024 || (blockSize & (blockSize - 1)) != 0 ||
-            ramBlocks <= 0 || vramBlocks <= 0 || device < 0 || context is < 8 or > 2048 || maxNew is < 1 or > 128)
+            ramBlocks <= 0 || vramBlocks <= 0 || device < 0 || context is < 8 or > 2048 || maxNew is < 1 or > 128 ||
+            kvRam < 1 || kvVram < 0 || !float.IsFinite(temperature) || temperature < 0 ||
+            !float.IsFinite(topP) || topP is <= 0 or > 1)
         {
             throw new InvalidDataException($"Invalid paged Llama model registration in '{path}'.");
         }
 
         var local = new PagedLlamaSettings(
             ResolveAsset(mounts.ModelRoot, config.Checkpoint, path),
-            ResolveAsset(mounts.ModelRoot, config.Tokenizer, path),
+            config.Tokenizer is null ? null : ResolveAsset(mounts.ModelRoot, config.Tokenizer, path),
+            config.Config is null ? null : ResolveAsset(mounts.ModelRoot, config.Config, path),
             Path.Combine(mounts.ConfigRoot, "model-swap"),
-            blockSize, ramBlocks, vramBlocks, device, context, maxNew);
+            blockSize, ramBlocks, vramBlocks, device, context, maxNew, kvRam, kvVram, temperature, topP);
         return new RegisteredModel(new ModelMetadata(registration.Id, PagedLlamaProviderId, "chat"),
             null, null, ReadPolicy(registration.Policy), local);
     }
