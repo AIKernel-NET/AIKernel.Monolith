@@ -17,13 +17,15 @@ internal sealed class PagedLlamaModel : IDisposable
     private static readonly IResourceAdmissibilityPolicy Admission = new ResourceAdmissibilityPolicy();
     private static readonly ErrorContext HealthUnavailable = new("Required device telemetry is unavailable.",
         "device_telemetry_unavailable", true) { FailureKind = FailureKind.FailClosed };
-    private readonly CudaVirtualMemoryDevice? cuda;
-    private readonly NvmlDeviceTelemetry? telemetry;
-    private readonly string? pciBusId;
+    private CudaVirtualMemoryDevice? cuda;
+    private readonly IDeviceHealthTelemetry? telemetry;
+    private readonly NvmlDeviceTelemetry? ownedTelemetry;
+    private string? pciBusId;
+    private int deviceOrdinal;
     private readonly bool telemetryFallback;
     private readonly long parameters;
     private readonly int quantizationBits;
-    private readonly TransformerCompute compute;
+    private TransformerCompute compute;
     private readonly PagedLlamaSettings settings;
     private readonly int cudaStatus;
     private readonly VirtualMemorySpace memory;
@@ -34,11 +36,10 @@ internal sealed class PagedLlamaModel : IDisposable
     private readonly long checkpointBytes;
     private readonly MappedModelFile? mapped;
 
-    internal bool UsesCuda => cuda is not null;
-
-    internal PagedLlamaModel(PagedLlamaSettings settings, CancellationToken token)
+    internal PagedLlamaModel(PagedLlamaSettings settings, CancellationToken token, IDeviceHealthTelemetry? healthTelemetry = null)
     {
         this.settings = settings;
+        deviceOrdinal = settings.Device;
         var extension = Path.GetExtension(settings.Checkpoint);
         var isMapped = extension.Equals(".gguf", StringComparison.OrdinalIgnoreCase) ||
             extension.Equals(".safetensors", StringComparison.OrdinalIgnoreCase);
@@ -67,11 +68,12 @@ internal sealed class PagedLlamaModel : IDisposable
             {
                 if (cuda is not null && settings.HealthLimits != default)
                 {
-                    telemetry = NvmlDeviceTelemetry.Open().Value;
+                    ownedTelemetry = healthTelemetry is null ? NvmlDeviceTelemetry.Open().Value : null;
+                    telemetry = healthTelemetry ?? ownedTelemetry;
                     pciBusId = cuda.GetPciBusId();
                     if (telemetry is null || pciBusId is null || !telemetry.Read(pciBusId).IsSuccess)
                     {
-                        telemetry?.Dispose();
+                        ownedTelemetry?.Dispose();
                         telemetry = null;
                         cuda.Dispose();
                         cuda = null;
@@ -107,7 +109,7 @@ internal sealed class PagedLlamaModel : IDisposable
             }
             catch
             {
-                telemetry?.Dispose();
+                ownedTelemetry?.Dispose();
                 cuda?.Dispose();
                 throw;
             }
@@ -121,7 +123,7 @@ internal sealed class PagedLlamaModel : IDisposable
 
     internal async Task<string> GenerateAsync(IReadOnlyList<ChatMessage> messages, Func<string, Task> emit,
         Dictionary<string, string> audit, LayerQosScheduler? scheduler, CancellationToken token,
-        LocalContinuation continuation = default)
+        LocalContinuation continuation = default, Func<int, LayerQosScheduler>? schedulerForDevice = null)
     {
         var prompt = FormatPrompt(messages);
         var tokens = tokenizer.Encode(prompt, token);
@@ -132,14 +134,22 @@ internal sealed class PagedLlamaModel : IDisposable
 
         if (telemetryFallback) audit["device_route"] = "cpu_telemetry_unavailable";
         PagedKvCache? cache = null;
-        using var lease = scheduler is null ? null : Require(scheduler.Enter(settings.Priority, Spill, token));
+        using var execution = new DeviceExecution();
+        if (cuda is not null)
+        {
+            scheduler ??= schedulerForDevice?.Invoke(deviceOrdinal);
+            if (scheduler is not null)
+                execution.Lease = Require(scheduler.Enter(settings.Priority, Spill, token));
+            audit["cuda_device_ordinal"] = deviceOrdinal.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
         var initial = memory.GetStatistics();
         var available = memory.GetAvailableBlocks();
         var kvBlockBytes = PagedKvCache.BlockSizeFor(shape.KvDimension);
         var useGpu = cuda is not null;
         var weightVram = useGpu ? (available.VramBlocks + initial.VramBlocks) * (long)settings.BlockSize : 0;
         var kvVram = useGpu ? settings.KvVramBlocks * (long)kvBlockBytes : 0;
-        var physicalVram = weightVram + kvVram;
+        var configuredVram = weightVram + kvVram;
+        var physicalVram = configuredVram;
         var request = new InferenceResourceRequest(parameters, quantizationBits, shape.BlockCount * settings.BlockSize,
             shape.Layers.Length, 2 * shape.KvDimension * sizeof(float), tokens.Count,
             Math.Min(maxNewTokens, shape.Context - tokens.Count + 1));
@@ -174,17 +184,124 @@ internal sealed class PagedLlamaModel : IDisposable
             : null;
         if (restored is not null) ValidateContinuation(restored, tokens);
         using var kv = cache = new PagedKvCache(shape, settings, cuda, compute, restored);
-        using var state = new ForwardState(shape, weights, compute, kv, settings, lease is null ? null : CheckLayer);
+        HashSet<string>? visitedDevices = null;
+        var migrations = 0;
+        var generatedTokens = 0;
+        long forwardLayers = 0;
+        using var state = new ForwardState(shape, weights, compute, kv, settings, CheckLayer);
         Result<int> Spill()
         {
             var kvSpill = cache!.DemoteDeviceBlocks();
             if (!kvSpill.IsSuccess) return kvSpill;
             return memory.DemoteDeviceBlocks();
         }
-        void CheckLayer()
+        TransformerCompute CheckLayer(int position, int layer)
         {
-            Require(lease!.Checkpoint());
-            if (settings.HealthLimits != default) Require(CheckHealth());
+            forwardLayers++;
+            if (execution.Lease is { } lease) Require(lease.Checkpoint());
+            if (cuda is null || settings.HealthLimits == default) return compute;
+            var health = CheckHealth();
+            if (health.Error?.Code == "device_temperature_exceeded" && schedulerForDevice is not null)
+                Migrate(position, layer);
+            else
+                Require(health);
+            return compute;
+        }
+
+        void Migrate(int position, int layer)
+        {
+            var previous = cuda!;
+            var previousPci = pciBusId!;
+            visitedDevices ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            visitedDevices.Add(previousPci);
+            var allowed = settings.ThermalMigrationDevices;
+            var deviceCount = allowed?.Length ?? CudaVirtualMemoryDevice.GetDeviceCount().Value;
+            var prepared = false;
+            for (var index = 0; index < deviceCount; index++)
+            {
+                token.ThrowIfCancellationRequested();
+                var ordinal = allowed is null ? index : allowed[index];
+                if (ordinal == deviceOrdinal) continue;
+                var candidate = CudaVirtualMemoryDevice.TryCreate(ordinal, out _);
+                if (candidate is null) continue;
+
+                var accepted = false;
+                LayerQosScheduler.Lease? targetLease = null;
+                try
+                {
+                    var targetPci = candidate.GetPciBusId();
+                    if (targetPci is null || visitedDevices.Contains(targetPci) || !CanMigrate(targetPci))
+                        continue;
+
+                    if (!prepared)
+                    {
+                        RequireMigration(memory.PrepareDeviceChange());
+                        if (settings.KvVramBlocks != 0) RequireMigration(kv.PrepareDeviceChange());
+                        previous.ZeroScratch();
+                        execution.Release();
+                        prepared = true;
+                    }
+
+                    var entered = schedulerForDevice!(ordinal).Enter(settings.Priority, Spill, token);
+                    if (!entered.IsSuccess)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        continue;
+                    }
+                    targetLease = entered.Value!;
+                    if (!CanMigrate(targetPci)) continue;
+
+                    var targetCompute = new TransformerCompute(candidate);
+                    RequireMigration(memory.BindPreparedDevice(candidate));
+                    if (settings.KvVramBlocks != 0)
+                    {
+                        var bound = kv.BindPreparedDevice(candidate);
+                        if (!bound.IsSuccess)
+                        {
+                            RequireMigration(memory.BindPreparedDevice(previous));
+                            RequireMigration(bound);
+                        }
+                    }
+
+                    cuda = candidate;
+                    pciBusId = targetPci;
+                    deviceOrdinal = ordinal;
+                    compute = targetCompute;
+                    weights.SetCompute(targetCompute);
+                    kv.SetCompute(targetCompute);
+                    execution.Lease = targetLease;
+                    targetLease = null;
+                    accepted = true;
+                    visitedDevices.Add(targetPci);
+                    migrations++;
+                    audit["gpu_migrations"] = migrations.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    audit["gpu_migration_from_pci"] = previousPci;
+                    audit["gpu_migration_to_pci"] = targetPci;
+                    audit["gpu_migration_position"] = position.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    audit["gpu_migration_layer"] = layer.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    audit["gpu_migration_after_generated_tokens"] = generatedTokens.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    audit["cuda_device_ordinal"] = ordinal.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    previous.Dispose();
+                    return;
+                }
+                finally
+                {
+                    targetLease?.Dispose();
+                    if (!accepted) candidate.Dispose();
+                }
+            }
+
+            throw new InferenceGovernanceException(new ErrorContext("No other permitted CUDA device meets the thermal and resource limits.",
+                "device_thermal_migration_unavailable", true) { FailureKind = FailureKind.FailClosed });
+        }
+
+        bool CanMigrate(string targetPci)
+        {
+            var health = CheckHealth(targetPci);
+            return health.IsSuccess && Admission.Evaluate(request, budget with
+            {
+                AvailableVramBytes = (long)Math.Min((ulong)configuredVram, health.Value.VramFreeBytes)
+            }).IsSuccess;
         }
         var decoder = Encoding.UTF8.GetDecoder();
         var gen2 = GC.CollectionCount(2);
@@ -219,6 +336,7 @@ internal sealed class PagedLlamaModel : IDisposable
                 break;
             }
 
+            generatedTokens++;
             var piece = tokenizer.Decode(next, decoder);
             if (piece.Length > 0)
             {
@@ -235,7 +353,8 @@ internal sealed class PagedLlamaModel : IDisposable
         }
 
         var final = memory.GetStatistics();
-        audit["qos_preemptions"] = (lease?.Preemptions ?? 0).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        audit["qos_preemptions"] = execution.Preemptions.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        audit["local_forward_layers"] = forwardLayers.ToString(System.Globalization.CultureInfo.InvariantCulture);
         audit["checkpoint_bytes"] = checkpointBytes.ToString(System.Globalization.CultureInfo.InvariantCulture);
         audit["weight_blocks"] = shape.BlockCount.ToString(System.Globalization.CultureInfo.InvariantCulture);
         audit["weight_ram_blocks"] = initial.RamBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -270,7 +389,7 @@ internal sealed class PagedLlamaModel : IDisposable
             try { cuda?.Dispose(); }
             finally
             {
-                telemetry?.Dispose();
+                ownedTelemetry?.Dispose();
                 mapped?.Dispose();
             }
         }
@@ -310,10 +429,33 @@ internal sealed class PagedLlamaModel : IDisposable
             throw new InvalidDataException("The snapshot model or prompt does not match the request.");
     }
 
-    private Result<DeviceHealthSnapshot> CheckHealth()
-        => DeviceHealthPolicy.Evaluate(telemetry is not null && pciBusId is not null
-            ? telemetry.Read(pciBusId) : Result<DeviceHealthSnapshot>.Fail(HealthUnavailable),
+    private Result<DeviceHealthSnapshot> CheckHealth(string? targetPci = null)
+        => DeviceHealthPolicy.Evaluate(telemetry is not null && (targetPci ?? pciBusId) is { } id
+            ? telemetry.Read(id) : Result<DeviceHealthSnapshot>.Fail(HealthUnavailable),
             settings.HealthLimits, settings.Priority);
+
+    private static void RequireMigration<T>(Result<T> result)
+    {
+        if (!result.IsSuccess)
+            throw new InferenceGovernanceException(new ErrorContext(result.Error!.Message, "device_thermal_migration_failed", false)
+            { FailureKind = FailureKind.FailClosed });
+    }
+
+    private sealed class DeviceExecution : IDisposable
+    {
+        private int preemptions;
+        internal LayerQosScheduler.Lease? Lease { get; set; }
+        internal int Preemptions => preemptions + (Lease?.Preemptions ?? 0);
+
+        internal void Release()
+        {
+            preemptions = Preemptions;
+            Lease?.Dispose();
+            Lease = null;
+        }
+
+        public void Dispose() => Release();
+    }
 
     private static T Require<T>(Result<T> result)
         => result.IsSuccess ? result.Value! : throw new InferenceGovernanceException(result.Error!);
@@ -330,7 +472,7 @@ internal sealed class PagedLlamaModel : IDisposable
             : string.Join('\n', messages.Select(message => $"{message.Role}: {message.Content}")) + "\nassistant:";
     }
 
-    private sealed unsafe class ForwardState(LlamaCheckpoint shape, PagedLlamaWeights weights, TransformerCompute compute, PagedKvCache kv, PagedLlamaSettings settings, Action? checkpoint) : IDisposable
+    private sealed unsafe class ForwardState(LlamaCheckpoint shape, PagedLlamaWeights weights, TransformerCompute compute, PagedKvCache kv, PagedLlamaSettings settings, Func<int, int, TransformerCompute> checkpoint) : IDisposable
     {
         private readonly float[] activation = new float[shape.Dimension];
         private readonly float[] normalized = new float[shape.Dimension];
@@ -395,7 +537,7 @@ internal sealed class PagedLlamaModel : IDisposable
 
                 weights.Multiply(layer.Down, gate, projected, token);
                 AddResidual();
-                checkpoint?.Invoke();
+                compute = checkpoint(position, index);
             }
         }
 

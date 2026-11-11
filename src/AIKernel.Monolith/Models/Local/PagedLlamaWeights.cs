@@ -7,7 +7,7 @@ namespace AIKernel.Monolith.Models.Local;
 internal sealed unsafe class PagedLlamaWeights : IDisposable
 {
     private readonly VirtualMemorySpace memory;
-    private readonly TransformerCompute compute;
+    private TransformerCompute compute;
     private readonly bool zeroWipe;
     private readonly VirtualMemoryBlockOperation multiply;
     private float* input;
@@ -97,6 +97,8 @@ internal sealed unsafe class PagedLlamaWeights : IDisposable
         NativeMemory.Free(staging);
         staging = null;
     }
+
+    internal void SetCompute(TransformerCompute replacement) => compute = replacement;
 
     internal long MatrixBlocks { get; private set; }
 }

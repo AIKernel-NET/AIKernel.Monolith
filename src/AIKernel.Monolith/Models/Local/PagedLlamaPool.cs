@@ -22,8 +22,8 @@ internal sealed class PagedLlamaPool : IDisposable
         try
         {
             session.Model ??= new PagedLlamaModel(settings, token);
-            var scheduler = session.Model.UsesCuda ? devices.GetOrAdd(settings.Device, static _ => new()) : null;
-            return Result<string>.Success(await session.Model.GenerateAsync(messages, emit, audit, scheduler, token));
+            return Result<string>.Success(await session.Model.GenerateAsync(messages, emit, audit, null, token,
+                schedulerForDevice: GetScheduler));
         }
         catch (InferenceGovernanceException ex)
         {
@@ -54,6 +54,8 @@ internal sealed class PagedLlamaPool : IDisposable
         }
     }
 
+    private LayerQosScheduler GetScheduler(int ordinal) => devices.GetOrAdd(ordinal, static _ => new());
+
     public void Dispose()
     {
         foreach (var session in sessions.Values)
@@ -79,7 +81,8 @@ internal sealed class PagedLlamaPool : IDisposable
 internal sealed record PagedLlamaSettings(string Checkpoint, string? Tokenizer, string? Config, string SwapDirectory,
     int BlockSize, int RamBlocks, int VramBlocks, int Device, int ContextTokens, int MaxNewTokens,
     int KvRamBlocks, int KvVramBlocks, float Temperature, float TopP, InferencePriority Priority,
-    long MaxPcieSwapBytes, DeviceHealthLimits HealthLimits, SwapEncryptionPolicy SwapPolicy);
+    long MaxPcieSwapBytes, DeviceHealthLimits HealthLimits, SwapEncryptionPolicy SwapPolicy,
+    int[]? ThermalMigrationDevices = null);
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 internal sealed record PagedLlamaRegistration([property: JsonPropertyName("checkpoint")] string? Checkpoint,
@@ -100,4 +103,5 @@ internal sealed record PagedLlamaRegistration([property: JsonPropertyName("check
     [property: JsonPropertyName("maxTemperatureCelsius")] uint? MaxTemperatureCelsius,
     [property: JsonPropertyName("batchPowerLimitPercent")] uint? BatchPowerLimitPercent,
     [property: JsonPropertyName("encryptSwap")] bool? EncryptSwap,
-    [property: JsonPropertyName("zeroWipe")] bool? ZeroWipe);
+    [property: JsonPropertyName("zeroWipe")] bool? ZeroWipe,
+    [property: JsonPropertyName("thermalMigrationDevices")] int[]? ThermalMigrationDevices);

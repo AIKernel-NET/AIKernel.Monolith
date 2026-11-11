@@ -8,7 +8,7 @@ namespace AIKernel.Monolith.Models.Local;
 internal sealed class PagedKvCache : IDisposable
 {
     private readonly VirtualMemorySpace memory;
-    private readonly TransformerCompute compute;
+    private TransformerCompute compute;
     private readonly bool zeroWipe;
     private readonly VirtualMemoryBlockOperation execute;
     private readonly int pagesPerLayer;
@@ -92,6 +92,12 @@ internal sealed class PagedKvCache : IDisposable
         => memory.Hibernate(path, continuation, allowPlaintext);
 
     internal Result<int> DemoteDeviceBlocks() => memory.DemoteDeviceBlocks();
+
+    internal Result<int> PrepareDeviceChange() => memory.PrepareDeviceChange();
+
+    internal Result<bool> BindPreparedDevice(CudaVirtualMemoryDevice device) => memory.BindPreparedDevice(device);
+
+    internal void SetCompute(TransformerCompute replacement) => compute = replacement;
 
     internal VirtualMemoryStatistics Statistics => memory.GetStatistics();
     private long Block(int layer, int position) => (long)layer * pagesPerLayer + position / rowsPerPage;
