@@ -178,6 +178,14 @@ no restriction. Filtering happens before similarity ranking and `topK`.
 When no document matches, search returns an empty `hits` array and answer
 returns `422 no_context`.
 
+Set `"stream": true` in the answer request body to receive Server-Sent
+Events. The first data event contains `id`, `model`, and the same `sources`
+that a buffered answer would use. It is followed by chat completion chunks
+with the same ID. A successful stream sends the final `finish_reason`
+and `[DONE]`. Errors before the first event use the usual HTTP status
+and JSON error body. Errors after output has started send an error event
+and end without `[DONE]`.
+
 ## Container Stack
 
 ```bash

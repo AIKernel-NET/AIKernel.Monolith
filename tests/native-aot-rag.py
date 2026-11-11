@@ -20,6 +20,7 @@ native_image = helpers["native_image"]
 wait_for_port = helpers["wait_for_port"]
 read_request = helpers["read_request"]
 audit_entries = helpers["audit_entries"]
+events = helpers["events"]
 
 KEY = "native-rag-test-only-key"
 INDEXES = "/v1/rag/indexes"
@@ -51,6 +52,8 @@ def smoke(exe, output):
         audit = roots["config"] / "inference-audit.jsonl"
         calls = []
         concurrent_adds = threading.Barrier(2, timeout=10)
+        stream_modes = iter(("live", "truncated", "early-error", "empty"))
+        release_stream = threading.Event()
 
         class Upstream(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -82,7 +85,36 @@ def smoke(exe, output):
                 assert user["role"] == "user" and user["content"].endswith("\n\nQuestion:\n" + QUESTION)
                 evidence = json.loads(user["content"].split("\n", 1)[1].split("\n\nQuestion:", 1)[0])
                 assert evidence == expected_evidence
+                if body.get("stream"):
+                    assert self.headers["Accept"] == "text/event-stream"
+                    self.send_stream(next(stream_modes))
+                    return
                 self.send_json(200, {"choices": [{"message": {"content": expected_answer}}]})
+
+            def send_stream(self, mode):
+                if mode == "early-error":
+                    self.send_json(503, {"error": "upstream unavailable"})
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if mode != "empty":
+                    self.frame({"index": 0, "delta": {"content": expected_answer[:20]}})
+                if mode == "truncated":
+                    return
+                if mode == "live":
+                    assert release_stream.wait(20), "Monolith buffered the first delta"
+                    self.frame({"index": 0, "delta": {"content": expected_answer[20:]}})
+                self.frame({"index": 0, "delta": {}, "finish_reason": "stop"})
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+            def frame(self, choice):
+                data = json.dumps({"choices": [choice]})
+                self.wfile.write(("data: " + data + "\n\n").encode())
+                self.wfile.flush()
 
             def send_json(self, status, payload):
                 encoded = json.dumps(payload).encode()
@@ -278,12 +310,53 @@ def smoke(exe, output):
                     filtered_answer = request(port, INDEX + "/answer", {**question, "filter": criteria}, 200)
                     assert filtered_answer["sources"] == matching and filtered_answer["answer"] == expected_answer
 
+                    stream_request = {**question, "filter": criteria, "stream": True}
+
+                    @contextmanager
+                    def answer_events():
+                        with closing(HTTPConnection("127.0.0.1", port, timeout=25)) as connection:
+                            connection.request("POST", INDEX + "/answer", json.dumps(stream_request),
+                                               {"Content-Type": "application/json", "Authorization": f"Bearer {KEY}"})
+                            response = connection.getresponse()
+                            assert response.status == 200
+                            assert response.getheader("Content-Type").startswith("text/event-stream")
+                            yield events(response)
+
+                    with answer_events() as frames:
+                        sources_frame = json.loads(next(frames))
+                        first = json.loads(next(frames))
+                        assert sources_frame == {"id": first["id"], "model": "chat", "sources": matching}
+                        first_delta = first["choices"][0]["delta"]["content"]
+                        assert first_delta == expected_answer[:20]
+                        release_stream.set()
+                        second, tail = json.loads(next(frames)), json.loads(next(frames))
+                        assert first["id"] == second["id"] == tail["id"]
+                        assert first_delta + second["choices"][0]["delta"]["content"] == expected_answer
+                        assert tail["choices"][0]["finish_reason"] == "stop"
+                        assert list(frames) == ["[DONE]"]
+
+                    with answer_events() as frames:
+                        assert json.loads(next(frames))["sources"] == matching
+                        assert json.loads(next(frames))["choices"][0]["delta"]["content"] == first_delta
+                        errors = list(frames)
+                        assert len(errors) == 1 and json.loads(errors[0])["error"]["code"] == "provider_error"
+
+                    early = request(port, INDEX + "/answer", stream_request, 502)
+                    assert early["error"]["code"] == "provider_error"
+                    with answer_events() as frames:
+                        empty_sources, empty_tail = json.loads(next(frames)), json.loads(next(frames))
+                        assert empty_sources["sources"] == matching and empty_sources["id"] == empty_tail["id"]
+                        assert empty_tail["choices"][0]["finish_reason"] == "stop"
+                        assert list(frames) == ["[DONE]"]
+
                     count = len(calls)
                     no_match = {"documentIds": ["planet"], "sources": [backup["source"]]}
                     assert filtered_search(no_match) == []
                     assert filtered_search({"sources": [backup["source"].upper()]}) == []
                     no_context = request(port, INDEX + "/answer", {**question, "filter": no_match}, 422)
                     assert no_context["error"]["code"] == "no_context"
+                    no_stream = request(port, INDEX + "/answer", {**stream_request, "filter": no_match}, 422)
+                    assert no_stream["error"]["code"] == "no_context"
                     for invalid in ({"documentIds": []}, {"documentIds": [" "]}, {"sources": [None]},
                                     {"sources": ["x" * 2049]}, {"documentIds": ["planet"] * 65}):
                         bad_filter = request(port, INDEX + "/search", {**query, "filter": invalid}, 400)
@@ -342,6 +415,8 @@ def smoke(exe, output):
                 entries = audit_entries(audit)
                 execution = [row for row in entries if row["EventType"] == "inference.execution"]
                 completion = next(row for row in execution if row["Metadata"].get("completion_id") == after_delete["id"])
+                streamed = next(row for row in execution if row["Metadata"].get("completion_id") == sources_frame["id"])
+                assert streamed["Description"] == "succeeded" and streamed["Metadata"]["operation"] == "rag.answer"
                 retrieval = next(row for row in execution
                                  if row["Metadata"]["request_id"] == completion["Metadata"]["request_id"]
                                  and row["Metadata"]["operation"] == "rag.answer.retrieve")
@@ -370,10 +445,13 @@ def smoke(exe, output):
                           "filtered_answer_sources": [hit["source"]["documentId"] for hit in filtered_answer["sources"]],
                           "filtered_answer": filtered_answer["answer"],
                           "filter_no_matches_skips_provider": True,
+                          "rag_sources_before_deltas": True, "rag_streamed_before_upstream_finish": True,
+                          "rag_truncated_stream_rejected": True, "rag_early_error_status": 502,
                           "upstream_calls": len(calls), "audit_records": len(entries)}
                 (output / "rag-result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
                 print(json.dumps(result, indent=2))
             finally:
+                release_stream.set()
                 if audit.exists():
                     shutil.copy2(audit, output / "rag-audit.jsonl")
                 upstream.shutdown()

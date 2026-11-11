@@ -38,7 +38,7 @@ internal sealed class OpenAIStreamingResponse(HttpContext context, string model,
         return WriteEventAsync(data);
     }
 
-    private async Task WriteEventAsync(string data)
+    internal async Task WriteEventAsync(string data)
     {
         var response = context.Response;
         if (!response.HasStarted)

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
 using AIKernel.Monolith.Internal;
 using AIKernel.Monolith.Models;
@@ -43,9 +44,55 @@ internal static class RagEndpointExtensions
                 RagJsonContext.Default.RagSearchResponse));
 
         indexes.MapPost("/answer", async (string indexId, RagAnswerRequest request, RagService rag,
-            HttpContext context, CancellationToken cancellationToken) =>
-            ToResult(await rag.AnswerAsync(indexId, request, context.TraceIdentifier, cancellationToken),
-                RagJsonContext.Default.RagAnswerResponse));
+            GovernedModelInference inference, HttpContext context, CancellationToken cancellationToken) =>
+        {
+            if (request.Stream == true)
+            {
+                return await StreamAnswerAsync(indexId, request, rag, inference, context, cancellationToken);
+            }
+
+            return ToResult(await rag.AnswerAsync(indexId, request, context.TraceIdentifier, cancellationToken),
+                RagJsonContext.Default.RagAnswerResponse);
+        });
+    }
+
+    private static async Task<IResult> StreamAnswerAsync(
+        string indexId, RagAnswerRequest request, RagService rag, GovernedModelInference inference,
+        HttpContext context, CancellationToken cancellationToken)
+    {
+        var prepared = await rag.PrepareAnswerAsync(indexId, request, context.TraceIdentifier, cancellationToken);
+        if (prepared.Error is { } prepareError)
+        {
+            return ErrorResponse(prepareError);
+        }
+
+        var answer = prepared.Value!;
+        var stream = new OpenAIStreamingResponse(context, answer.Model, chat: true, cancellationToken);
+        var sources = new RagAnswerSources(stream.Id, answer.Model, answer.Sources);
+        var outcome = await inference.StreamAsync(answer.Model, answer.Messages, context.TraceIdentifier,
+            "rag.answer", stream.Id, async text =>
+            {
+                await WriteSourcesAsync();
+                await stream.WriteChunkAsync(text);
+            }, cancellationToken);
+        if (outcome.Error is { } error)
+        {
+            if (!context.Response.HasStarted)
+            {
+                return ErrorResponse(error);
+            }
+
+            await stream.WriteErrorAsync(error);
+            return Results.Empty;
+        }
+
+        await WriteSourcesAsync();
+        await stream.CompleteAsync(outcome.Value!);
+        return Results.Empty;
+
+        Task WriteSourcesAsync() => context.Response.HasStarted
+            ? Task.CompletedTask
+            : stream.WriteEventAsync(JsonSerializer.Serialize(sources, RagJsonContext.Default.RagAnswerSources));
     }
 
     private static IResult ToResult<T>(InferenceOutcome<T> outcome, JsonTypeInfo<T> typeInfo) where T : class

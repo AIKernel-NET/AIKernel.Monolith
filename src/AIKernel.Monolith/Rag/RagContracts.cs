@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using AIKernel.Monolith.OpenAI;
 
 namespace AIKernel.Monolith.Rag;
 
@@ -11,7 +12,9 @@ internal sealed record RagDocumentListResponse(string IndexId, RagDocumentSummar
 internal sealed record RagDocumentSummary(string DocumentId, string? Title, string? Source, int ChunkCount);
 
 internal sealed record RagSearchRequest(string? Query, int? TopK, RagFilter? Filter);
-internal sealed record RagAnswerRequest(string? Model, string? Question, int? TopK, RagFilter? Filter);
+internal sealed record RagAnswerRequest(string? Model, string? Question, int? TopK, RagFilter? Filter, bool? Stream);
+internal sealed record RagAnswerContext(string Model, ChatMessage[] Messages, RagHit[] Sources);
+internal sealed record RagAnswerSources(string Id, string Model, RagHit[] Sources);
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 internal sealed record RagFilter(string?[]? DocumentIds, string?[]? Sources);

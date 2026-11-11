@@ -353,6 +353,22 @@ internal sealed class RagService(
     internal async Task<InferenceOutcome<RagAnswerResponse>> AnswerAsync(
         string indexId, RagAnswerRequest request, string requestId, CancellationToken cancellationToken)
     {
+        var prepared = await PrepareAnswerAsync(indexId, request, requestId, cancellationToken);
+        if (prepared.Error is { } prepareError)
+        {
+            return new(Error: prepareError);
+        }
+
+        var answer = prepared.Value!;
+        var completion = await inference.CompleteAsync(answer.Model, answer.Messages, requestId, "rag.answer", cancellationToken);
+        return completion.Error is { } error
+            ? new(Error: error)
+            : new(Value: new RagAnswerResponse(completion.Value!.Id, answer.Model, completion.Value.Text, answer.Sources));
+    }
+
+    internal async Task<InferenceOutcome<RagAnswerContext>> PrepareAnswerAsync(
+        string indexId, RagAnswerRequest request, string requestId, CancellationToken cancellationToken)
+    {
         if (string.IsNullOrWhiteSpace(request.Model))
         {
             return new(Error: InferenceErrors.InvalidRequest);
@@ -381,10 +397,7 @@ internal sealed class RagService(
                 """),
             new("user", $"Evidence (JSON):\n{context}\n\nQuestion:\n{request.Question}")
         ];
-        var completion = await inference.CompleteAsync(request.Model, messages, requestId, "rag.answer", cancellationToken);
-        return completion.Error is { } error
-            ? new(Error: error)
-            : new(Value: new RagAnswerResponse(completion.Value!.Id, request.Model, completion.Value.Text, sources));
+        return new(Value: new RagAnswerContext(request.Model, messages, sources));
     }
 
     private async Task<InferenceOutcome<RagSearchResponse>> RetrieveAsync(
