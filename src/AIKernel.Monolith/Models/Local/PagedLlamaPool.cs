@@ -2,6 +2,9 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using AIKernel.Common.Results;
+using AIKernel.Core.Governance;
+using AIKernel.Core.Memory;
+using AIKernel.Kernel.Governance;
 using AIKernel.Monolith.OpenAI;
 
 namespace AIKernel.Monolith.Models.Local;
@@ -9,6 +12,7 @@ namespace AIKernel.Monolith.Models.Local;
 internal sealed class PagedLlamaPool : IDisposable
 {
     private readonly ConcurrentDictionary<string, Session> sessions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<int, LayerQosScheduler> devices = new();
 
     internal async Task<Result<string>> GenerateAsync(string id, PagedLlamaSettings settings, IReadOnlyList<ChatMessage> messages,
         Func<string, Task> emit, Dictionary<string, string> audit, CancellationToken token)
@@ -18,13 +22,18 @@ internal sealed class PagedLlamaPool : IDisposable
         try
         {
             session.Model ??= new PagedLlamaModel(settings, token);
-            return Result<string>.Success(await session.Model.GenerateAsync(messages, emit, audit, token));
+            var scheduler = session.Model.UsesCuda ? devices.GetOrAdd(settings.Device, static _ => new()) : null;
+            return Result<string>.Success(await session.Model.GenerateAsync(messages, emit, audit, scheduler, token));
+        }
+        catch (InferenceGovernanceException ex)
+        {
+            return Result<string>.Fail(ex.Error);
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException
             or InvalidOperationException or DllNotFoundException or EntryPointNotFoundException
             or NotSupportedException or OutOfMemoryException or System.Text.DecoderFallbackException or ArgumentException
             or JsonException or KeyNotFoundException or OverflowException or FormatException or AggregateException
-            or UnsupportedModelException or LocalContextLengthException)
+            or UnsupportedModelException or LocalContextLengthException or System.Security.Cryptography.CryptographicException)
         {
             var code = ex switch
             {
@@ -69,7 +78,8 @@ internal sealed class PagedLlamaPool : IDisposable
 
 internal sealed record PagedLlamaSettings(string Checkpoint, string? Tokenizer, string? Config, string SwapDirectory,
     int BlockSize, int RamBlocks, int VramBlocks, int Device, int ContextTokens, int MaxNewTokens,
-    int KvRamBlocks, int KvVramBlocks, float Temperature, float TopP);
+    int KvRamBlocks, int KvVramBlocks, float Temperature, float TopP, InferencePriority Priority,
+    long MaxPcieSwapBytes, DeviceHealthLimits HealthLimits, SwapEncryptionPolicy SwapPolicy);
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 internal sealed record PagedLlamaRegistration([property: JsonPropertyName("checkpoint")] string? Checkpoint,
@@ -84,4 +94,10 @@ internal sealed record PagedLlamaRegistration([property: JsonPropertyName("check
     [property: JsonPropertyName("kvRamBlocks")] int? KvRamBlocks,
     [property: JsonPropertyName("kvVramBlocks")] int? KvVramBlocks,
     [property: JsonPropertyName("temperature")] float? Temperature,
-    [property: JsonPropertyName("topP")] float? TopP);
+    [property: JsonPropertyName("topP")] float? TopP,
+    [property: JsonPropertyName("priority")] string? Priority,
+    [property: JsonPropertyName("maxPcieSwapBytes")] long? MaxPcieSwapBytes,
+    [property: JsonPropertyName("maxTemperatureCelsius")] uint? MaxTemperatureCelsius,
+    [property: JsonPropertyName("batchPowerLimitPercent")] uint? BatchPowerLimitPercent,
+    [property: JsonPropertyName("encryptSwap")] bool? EncryptSwap,
+    [property: JsonPropertyName("zeroWipe")] bool? ZeroWipe);

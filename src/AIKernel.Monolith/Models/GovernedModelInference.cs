@@ -218,6 +218,9 @@ internal sealed class GovernedModelInference(
                 {
                     "unsupported_model_format" => InferenceErrors.UnsupportedLocalModel,
                     "local_memory_exhausted" => InferenceErrors.LocalMemoryExhausted,
+                    "resource_budget_exceeded" or "resource_pcie_budget_exceeded" or "device_queue_full" or
+                    "device_temperature_exceeded" or "device_power_throttled" or "device_telemetry_unavailable"
+                        => new InferenceError(503, reason, "The configured local inference route is unavailable."),
                     _ => InferenceErrors.ProviderFailed
                 })
                 : new(Error: InferenceErrors.AuditUnavailable);

@@ -1,5 +1,11 @@
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using AIKernel.Common.Results;
+using AIKernel.Core.Governance;
+using AIKernel.Core.Memory;
+using AIKernel.Kernel.Governance;
 using System.Text;
 using AIKernel.Kernel.Memory;
 using AIKernel.Monolith.OpenAI;
@@ -8,7 +14,15 @@ namespace AIKernel.Monolith.Models.Local;
 
 internal sealed class PagedLlamaModel : IDisposable
 {
+    private static readonly IResourceAdmissibilityPolicy Admission = new ResourceAdmissibilityPolicy();
+    private static readonly ErrorContext HealthUnavailable = new("Required device telemetry is unavailable.",
+        "device_telemetry_unavailable", true) { FailureKind = FailureKind.FailClosed };
     private readonly CudaVirtualMemoryDevice? cuda;
+    private readonly NvmlDeviceTelemetry? telemetry;
+    private readonly string? pciBusId;
+    private readonly bool telemetryFallback;
+    private readonly long parameters;
+    private readonly int quantizationBits;
     private readonly TransformerCompute compute;
     private readonly PagedLlamaSettings settings;
     private readonly int cudaStatus;
@@ -19,6 +33,8 @@ internal sealed class PagedLlamaModel : IDisposable
     private readonly int maxNewTokens;
     private readonly long checkpointBytes;
     private readonly MappedModelFile? mapped;
+
+    internal bool UsesCuda => cuda is not null;
 
     internal PagedLlamaModel(PagedLlamaSettings settings, CancellationToken token)
     {
@@ -36,18 +52,40 @@ internal sealed class PagedLlamaModel : IDisposable
             tokenizer = settings.Tokenizer is { } tokenizerPath
                 ? new LlamaTokenizer(tokenizerPath, shape.Vocabulary)
                 : LlamaTokenizer.FromEmbedded(mapped, shape.Vocabulary);
+            long encodedWeightBytes = 0;
+            foreach (var matrix in shape.Matrices)
+            {
+                parameters = checked(parameters + (long)matrix.Rows * matrix.Columns);
+                encodedWeightBytes = checked(encodedWeightBytes + (long)matrix.Rows *
+                    MappedModelFile.RowBytes(matrix.Encoding, matrix.Columns));
+            }
+            quantizationBits = checked((int)((encodedWeightBytes * 8 + parameters - 1) / parameters));
             maxNewTokens = settings.MaxNewTokens;
             Directory.CreateDirectory(settings.SwapDirectory);
             cuda = CudaVirtualMemoryDevice.TryCreate(settings.Device, out cudaStatus);
-            compute = new TransformerCompute(cuda);
             try
             {
+                if (cuda is not null && settings.HealthLimits != default)
+                {
+                    telemetry = NvmlDeviceTelemetry.Open().Value;
+                    pciBusId = cuda.GetPciBusId();
+                    if (telemetry is null || pciBusId is null || !telemetry.Read(pciBusId).IsSuccess)
+                    {
+                        telemetry?.Dispose();
+                        telemetry = null;
+                        cuda.Dispose();
+                        cuda = null;
+                        telemetryFallback = true;
+                    }
+                }
+
+                compute = new TransformerCompute(cuda);
                 var source = mapped is null ? null : new MappedTensorSource(mapped, shape.Matrices.ToArray());
                 memory = new VirtualMemorySpace(shape.BlockCount, settings.BlockSize, settings.RamBlocks,
-                    settings.SwapDirectory, cuda is null ? 0 : settings.VramBlocks, cuda, source);
+                    settings.SwapDirectory, cuda is null ? 0 : settings.VramBlocks, cuda, source, settings.SwapPolicy);
                 try
                 {
-                    weights = new PagedLlamaWeights(memory, compute);
+                    weights = new PagedLlamaWeights(memory, compute, settings.SwapPolicy.ZeroWipe);
                     try
                     {
                         if (legacy is not null)
@@ -69,6 +107,7 @@ internal sealed class PagedLlamaModel : IDisposable
             }
             catch
             {
+                telemetry?.Dispose();
                 cuda?.Dispose();
                 throw;
             }
@@ -81,7 +120,8 @@ internal sealed class PagedLlamaModel : IDisposable
     }
 
     internal async Task<string> GenerateAsync(IReadOnlyList<ChatMessage> messages, Func<string, Task> emit,
-        Dictionary<string, string> audit, CancellationToken token)
+        Dictionary<string, string> audit, LayerQosScheduler? scheduler, CancellationToken token,
+        LocalContinuation continuation = default)
     {
         var prompt = FormatPrompt(messages);
         var tokens = tokenizer.Encode(prompt, token);
@@ -90,17 +130,78 @@ internal sealed class PagedLlamaModel : IDisposable
             throw new LocalContextLengthException();
         }
 
+        if (telemetryFallback) audit["device_route"] = "cpu_telemetry_unavailable";
+        PagedKvCache? cache = null;
+        using var lease = scheduler is null ? null : Require(scheduler.Enter(settings.Priority, Spill, token));
         var initial = memory.GetStatistics();
+        var available = memory.GetAvailableBlocks();
+        var kvBlockBytes = PagedKvCache.BlockSizeFor(shape.KvDimension);
+        var useGpu = cuda is not null;
+        var weightVram = useGpu ? (available.VramBlocks + initial.VramBlocks) * (long)settings.BlockSize : 0;
+        var kvVram = useGpu ? settings.KvVramBlocks * (long)kvBlockBytes : 0;
+        var physicalVram = weightVram + kvVram;
+        var request = new InferenceResourceRequest(parameters, quantizationBits, shape.BlockCount * settings.BlockSize,
+            shape.Layers.Length, 2 * shape.KvDimension * sizeof(float), tokens.Count,
+            Math.Min(maxNewTokens, shape.Context - tokens.Count + 1));
+
+        if (useGpu && settings.HealthLimits != default)
+        {
+            var health = Require(CheckHealth());
+            var reclaimable = (ulong)initial.VramBlocks * (ulong)settings.BlockSize;
+            physicalVram = (long)Math.Min((ulong)physicalVram,
+                Math.Min(health.VramFreeBytes, (ulong)long.MaxValue - reclaimable) + reclaimable);
+            audit["device_temperature_celsius"] = health.TemperatureCelsius.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        var budget = new InferenceResourceBudget(settings.BlockSize, kvBlockBytes,
+            (available.RamBlocks + initial.RamBlocks) * (long)settings.BlockSize +
+                settings.KvRamBlocks * (long)kvBlockBytes, physicalVram,
+            settings.MaxPcieSwapBytes, useGpu, weightVram, kvVram);
+        var gate = ResultStep<InferenceResourceRequest, InferenceResourceEstimate>.FromResult(request,
+            Admission.Evaluate(request, budget));
+        var estimate = Require(gate.ToResult());
+        audit["resource_minimum_ram_blocks"] = estimate.MinimumRamBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        audit["resource_minimum_vram_blocks"] = estimate.MinimumVramBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        audit["resource_estimated_pcie_bytes"] = estimate.EstimatedPcieBytes.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        audit["qos_priority"] = settings.Priority.ToString();
         var matrixBlocks = weights.MatrixBlocks;
-        using var kv = new PagedKvCache(shape, settings, cuda, compute);
-        using var state = new ForwardState(shape, weights, compute, kv, settings);
+        if (!continuation.FirstLogits.IsEmpty && continuation.FirstLogits.Length != shape.Vocabulary)
+            throw new ArgumentException("The logits buffer must match the vocabulary.");
+        using var restored = continuation.RestorePath is { } restorePath
+            ? Require(VirtualMemorySpace.Restore(restorePath, ramBlocks: settings.KvRamBlocks,
+                vramBlocks: useGpu ? settings.KvVramBlocks : 0, device: cuda,
+                swapDirectory: settings.SwapDirectory, swapPolicy: settings.SwapPolicy))
+            : null;
+        if (restored is not null) ValidateContinuation(restored, tokens);
+        using var kv = cache = new PagedKvCache(shape, settings, cuda, compute, restored);
+        using var state = new ForwardState(shape, weights, compute, kv, settings, lease is null ? null : CheckLayer);
+        Result<int> Spill()
+        {
+            var kvSpill = cache!.DemoteDeviceBlocks();
+            if (!kvSpill.IsSuccess) return kvSpill;
+            return memory.DemoteDeviceBlocks();
+        }
+        void CheckLayer()
+        {
+            Require(lease!.Checkpoint());
+            if (settings.HealthLimits != default) Require(CheckHealth());
+        }
         var decoder = Encoding.UTF8.GetDecoder();
         var gen2 = GC.CollectionCount(2);
         var allocated = GC.GetTotalAllocatedBytes(precise: false);
         long maxStepTicks = 0;
-        for (var pos = 0; pos < tokens.Count - 1; pos++)
+        if (restored is null)
         {
-            state.Forward(tokens[pos], pos, token);
+            for (var pos = 0; pos < tokens.Count - 1; pos++)
+                state.Forward(tokens[pos], pos, token);
+        }
+        audit["local_prefill_tokens"] = (restored is null ? tokens.Count - 1 : 0)
+            .ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (continuation.SavePath is { } savePath)
+        {
+            Span<byte> checkpoint = stackalloc byte[40];
+            WriteContinuation(tokens, checkpoint);
+            Require(kv.Hibernate(savePath, checkpoint, continuation.AllowPlaintext));
         }
 
         var position = tokens.Count - 1;
@@ -110,7 +211,7 @@ internal sealed class PagedLlamaModel : IDisposable
         {
             var stepStarted = Stopwatch.GetTimestamp();
             state.Forward(current, position, token);
-            var next = state.Predict(token);
+            var next = state.Predict(token, step == 0 ? continuation.FirstLogits.Span : default);
             maxStepTicks = Math.Max(maxStepTicks, Stopwatch.GetTimestamp() - stepStarted);
             if (next is LlamaTokenizer.Begin or LlamaTokenizer.End)
             {
@@ -134,6 +235,7 @@ internal sealed class PagedLlamaModel : IDisposable
         }
 
         var final = memory.GetStatistics();
+        audit["qos_preemptions"] = (lease?.Preemptions ?? 0).ToString(System.Globalization.CultureInfo.InvariantCulture);
         audit["checkpoint_bytes"] = checkpointBytes.ToString(System.Globalization.CultureInfo.InvariantCulture);
         audit["weight_blocks"] = shape.BlockCount.ToString(System.Globalization.CultureInfo.InvariantCulture);
         audit["weight_ram_blocks"] = initial.RamBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -166,9 +268,55 @@ internal sealed class PagedLlamaModel : IDisposable
         finally
         {
             try { cuda?.Dispose(); }
-            finally { mapped?.Dispose(); }
+            finally
+            {
+                telemetry?.Dispose();
+                mapped?.Dispose();
+            }
         }
     }
+
+    private void WriteContinuation(List<int> tokens, Span<byte> state)
+    {
+        BinaryPrimitives.WriteInt32LittleEndian(state, tokens.Count - 1);
+        BinaryPrimitives.WriteInt32LittleEndian(state[4..], tokens[^1]);
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        Span<byte> asset = stackalloc byte[SHA256.HashSizeInBytes];
+        using (var file = File.OpenRead(settings.Checkpoint))
+            SHA256.HashData(file, asset);
+        hash.AppendData(asset);
+        foreach (var path in new[] { settings.Tokenizer, settings.Config })
+        {
+            asset.Clear();
+            if (path is not null)
+            {
+                using var file = File.OpenRead(path);
+                SHA256.HashData(file, asset);
+            }
+            hash.AppendData(asset);
+        }
+        hash.AppendData(MemoryMarshal.AsBytes(CollectionsMarshal.AsSpan(tokens)));
+        hash.GetHashAndReset(state[8..]);
+    }
+
+    private void ValidateContinuation(VirtualMemorySpace restored, List<int> tokens)
+    {
+        Span<byte> actual = stackalloc byte[40];
+        Span<byte> expected = stackalloc byte[40];
+        if (restored.ReadSnapshotState(actual).Value != actual.Length)
+            throw new InvalidDataException("The snapshot has no compatible model continuation.");
+        WriteContinuation(tokens, expected);
+        if (!CryptographicOperations.FixedTimeEquals(actual, expected))
+            throw new InvalidDataException("The snapshot model or prompt does not match the request.");
+    }
+
+    private Result<DeviceHealthSnapshot> CheckHealth()
+        => DeviceHealthPolicy.Evaluate(telemetry is not null && pciBusId is not null
+            ? telemetry.Read(pciBusId) : Result<DeviceHealthSnapshot>.Fail(HealthUnavailable),
+            settings.HealthLimits, settings.Priority);
+
+    private static T Require<T>(Result<T> result)
+        => result.IsSuccess ? result.Value! : throw new InferenceGovernanceException(result.Error!);
 
     private static string FormatPrompt(IReadOnlyList<ChatMessage> messages)
     {
@@ -182,7 +330,7 @@ internal sealed class PagedLlamaModel : IDisposable
             : string.Join('\n', messages.Select(message => $"{message.Role}: {message.Content}")) + "\nassistant:";
     }
 
-    private sealed unsafe class ForwardState(LlamaCheckpoint shape, PagedLlamaWeights weights, TransformerCompute compute, PagedKvCache kv, PagedLlamaSettings settings) : IDisposable
+    private sealed unsafe class ForwardState(LlamaCheckpoint shape, PagedLlamaWeights weights, TransformerCompute compute, PagedKvCache kv, PagedLlamaSettings settings, Action? checkpoint) : IDisposable
     {
         private readonly float[] activation = new float[shape.Dimension];
         private readonly float[] normalized = new float[shape.Dimension];
@@ -204,7 +352,22 @@ internal sealed class PagedLlamaModel : IDisposable
         private Span<float> Logits => new(scratch + 2 * shape.HiddenDimension, shape.Vocabulary);
         private Span<int> SampleIndices => new(scratch + 2 * shape.HiddenDimension + shape.Vocabulary, shape.Vocabulary);
 
-        public void Dispose() => NativeMemory.Free(scratch);
+        public void Dispose()
+        {
+            if (settings.SwapPolicy.ZeroWipe)
+            {
+                CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(new Span<float>(scratch,
+                    2 * shape.HiddenDimension + 2 * shape.Vocabulary)));
+                activation.AsSpan().Clear();
+                normalized.AsSpan().Clear();
+                query.AsSpan().Clear();
+                key.AsSpan().Clear();
+                value.AsSpan().Clear();
+                attended.AsSpan().Clear();
+                projected.AsSpan().Clear();
+            }
+            NativeMemory.Free(scratch);
+        }
 
         internal void Forward(int tokenId, int position, CancellationToken token)
         {
@@ -232,14 +395,16 @@ internal sealed class PagedLlamaModel : IDisposable
 
                 weights.Multiply(layer.Down, gate, projected, token);
                 AddResidual();
+                checkpoint?.Invoke();
             }
         }
 
-        internal int Predict(CancellationToken token)
+        internal int Predict(CancellationToken token, Span<float> firstLogits)
         {
             Normalize(weights.ReadRow(shape.FinalNorm, 0));
             var logits = Logits;
             weights.Multiply(shape.Classifier, normalized, logits, token);
+            if (!firstLogits.IsEmpty) logits.CopyTo(firstLogits);
             var best = 0;
             for (var i = 0; i < logits.Length; i++)
             {
@@ -347,6 +512,14 @@ internal sealed class PagedLlamaModel : IDisposable
             }
         }
     }
+}
+
+internal readonly record struct LocalContinuation(string? SavePath, string? RestorePath,
+    Memory<float> FirstLogits, bool AllowPlaintext = false);
+
+internal sealed class InferenceGovernanceException(ErrorContext error) : Exception(error.Message)
+{
+    internal ErrorContext Error { get; } = error;
 }
 
 internal sealed class LocalContextLengthException : Exception;

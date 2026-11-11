@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using AIKernel.Kernel.Memory;
 
 namespace AIKernel.Monolith.Models.Local;
@@ -7,6 +8,7 @@ internal sealed unsafe class PagedLlamaWeights : IDisposable
 {
     private readonly VirtualMemorySpace memory;
     private readonly TransformerCompute compute;
+    private readonly bool zeroWipe;
     private readonly VirtualMemoryBlockOperation multiply;
     private float* input;
     private float* output;
@@ -17,10 +19,11 @@ internal sealed unsafe class PagedLlamaWeights : IDisposable
     private Span<byte> Staging => new(staging, memory.BlockSize);
     private long cachedBlock = -1;
 
-    internal PagedLlamaWeights(VirtualMemorySpace memory, TransformerCompute compute)
+    internal PagedLlamaWeights(VirtualMemorySpace memory, TransformerCompute compute, bool zeroWipe)
     {
         this.memory = memory;
         this.compute = compute;
+        this.zeroWipe = zeroWipe;
         multiply = MultiplyBlock;
         staging = (byte*)NativeMemory.Alloc((nuint)memory.BlockSize);
     }
@@ -90,6 +93,7 @@ internal sealed unsafe class PagedLlamaWeights : IDisposable
 
     public void Dispose()
     {
+        if (zeroWipe && staging != null) CryptographicOperations.ZeroMemory(Staging);
         NativeMemory.Free(staging);
         staging = null;
     }

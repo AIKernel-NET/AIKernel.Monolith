@@ -2,6 +2,8 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using AIKernel.Dtos.Governance;
 using AIKernel.Enums.Governance;
+using AIKernel.Core.Governance;
+using AIKernel.Core.Memory;
 using AIKernel.Monolith.Hosting;
 using AIKernel.Monolith.Internal;
 using AIKernel.Monolith.Models.Local;
@@ -134,12 +136,24 @@ public sealed class ModelProviderRegistry
         var kvVram = config?.KvVramBlocks ?? 16;
         var temperature = config?.Temperature ?? 0;
         var topP = config?.TopP ?? 1;
+        var maxPcie = config?.MaxPcieSwapBytes ?? long.MaxValue;
+        var maxTemperature = config?.MaxTemperatureCelsius ?? 0;
+        var batchPower = config?.BatchPowerLimitPercent ?? 0;
+        var priority = config?.Priority switch
+        {
+            null or "normal" => InferencePriority.Normal,
+            "backgroundBatch" => InferencePriority.BackgroundBatch,
+            "high" => InferencePriority.High,
+            "emergency" => InferencePriority.Emergency,
+            _ => (InferencePriority?)null
+        };
         if (string.IsNullOrWhiteSpace(registration.Id) || registration.Kind is not (null or "chat") ||
             registration.Endpoint is not null || registration.ApiKeyEnvironmentVariable is not null ||
             config is null || blockSize is < 4096 or > 32 * 1024 * 1024 || (blockSize & (blockSize - 1)) != 0 ||
             ramBlocks <= 0 || vramBlocks <= 0 || device < 0 || context is < 8 or > 2048 || maxNew is < 1 or > 128 ||
             kvRam < 1 || kvVram < 0 || !float.IsFinite(temperature) || temperature < 0 ||
-            !float.IsFinite(topP) || topP is <= 0 or > 1)
+            !float.IsFinite(topP) || topP is <= 0 or > 1 || priority is null ||
+            maxPcie < 0 || maxTemperature > 120 || batchPower > 100)
         {
             throw new InvalidDataException($"Invalid paged Llama model registration in '{path}'.");
         }
@@ -149,7 +163,8 @@ public sealed class ModelProviderRegistry
             config.Tokenizer is null ? null : ResolveAsset(mounts.ModelRoot, config.Tokenizer, path),
             config.Config is null ? null : ResolveAsset(mounts.ModelRoot, config.Config, path),
             Path.Combine(mounts.ConfigRoot, "model-swap"),
-            blockSize, ramBlocks, vramBlocks, device, context, maxNew, kvRam, kvVram, temperature, topP);
+            blockSize, ramBlocks, vramBlocks, device, context, maxNew, kvRam, kvVram, temperature, topP,
+            priority.Value, maxPcie, new(maxTemperature, batchPower), new(config.EncryptSwap ?? false, config.ZeroWipe ?? false));
         return new RegisteredModel(new ModelMetadata(registration.Id, PagedLlamaProviderId, "chat"),
             null, null, ReadPolicy(registration.Policy), local);
     }

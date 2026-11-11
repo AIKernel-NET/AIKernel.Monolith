@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using AIKernel.Core.Memory;
+using AIKernel.Common.Results;
 using AIKernel.Kernel.Memory;
 
 namespace AIKernel.Monolith.Models.Local;
@@ -8,6 +9,7 @@ internal sealed class PagedKvCache : IDisposable
 {
     private readonly VirtualMemorySpace memory;
     private readonly TransformerCompute compute;
+    private readonly bool zeroWipe;
     private readonly VirtualMemoryBlockOperation execute;
     private readonly int pagesPerLayer;
     private readonly int kvWidth;
@@ -21,16 +23,21 @@ internal sealed class PagedKvCache : IDisposable
     private bool values;
 
     internal PagedKvCache(LlamaCheckpoint shape, PagedLlamaSettings settings, CudaVirtualMemoryDevice? cuda,
-        TransformerCompute compute)
+        TransformerCompute compute, VirtualMemorySpace? restored = null)
     {
         this.compute = compute;
+        zeroWipe = settings.SwapPolicy.ZeroWipe;
         execute = ExecuteTile;
         kvWidth = shape.KvDimension;
-        var blockSize = Math.Max(64 * 1024, 2 * kvWidth * sizeof(float));
+        var blockSize = BlockSizeFor(kvWidth);
         rowsPerPage = blockSize / (2 * kvWidth * sizeof(float));
         pagesPerLayer = (shape.Context + rowsPerPage - 1) / rowsPerPage;
-        memory = new VirtualMemorySpace((long)shape.Layers.Length * pagesPerLayer, blockSize,
-            settings.KvRamBlocks, settings.SwapDirectory, cuda is null ? 0 : settings.KvVramBlocks, cuda);
+        var expectedBlocks = (long)shape.Layers.Length * pagesPerLayer;
+        if (restored is not null && (restored.BlockSize != blockSize || restored.BlockCount != expectedBlocks))
+            throw new InvalidDataException("The snapshot KV dimensions differ from the model.");
+        memory = restored ?? new VirtualMemorySpace(expectedBlocks, blockSize,
+            settings.KvRamBlocks, settings.SwapDirectory, cuda is null ? 0 : settings.KvVramBlocks, cuda,
+            swapPolicy: settings.SwapPolicy);
         scores = new float[shape.Context];
         scaledQuery = new float[shape.HeadSize];
         weightedValues = new float[shape.HeadSize];
@@ -79,8 +86,24 @@ internal sealed class PagedKvCache : IDisposable
         compute.AttentionTile(host, device, input, output, rowCount, kvWidth, headOffset, scaledQuery.Length, values);
     }
 
+    internal static int BlockSizeFor(int kvWidth) => Math.Max(64 * 1024, 2 * kvWidth * sizeof(float));
+
+    internal Result<SnapshotManifest> Hibernate(string path, ReadOnlySpan<byte> continuation, bool allowPlaintext)
+        => memory.Hibernate(path, continuation, allowPlaintext);
+
+    internal Result<int> DemoteDeviceBlocks() => memory.DemoteDeviceBlocks();
+
     internal VirtualMemoryStatistics Statistics => memory.GetStatistics();
     private long Block(int layer, int position) => (long)layer * pagesPerLayer + position / rowsPerPage;
 
-    public void Dispose() => memory.Dispose();
+    public void Dispose()
+    {
+        if (zeroWipe)
+        {
+            scores.AsSpan().Clear();
+            scaledQuery.AsSpan().Clear();
+            weightedValues.AsSpan().Clear();
+        }
+        memory.Dispose();
+    }
 }

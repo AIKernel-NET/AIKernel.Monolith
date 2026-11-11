@@ -183,6 +183,34 @@ Linux container without the NVIDIA driver. Pass `--oversized-device <ordinal>`
 to generate a sparse FP32 GGUF larger than that device and verify real CUDA
 page-ins during generation.
 
+### Local inference governance
+
+A registered local model can set these optional policy fields.
+
+| Field | Values |
+| --- | --- |
+| `priority` | `backgroundBatch`, `normal`, `high`, `emergency` |
+| `maxPcieSwapBytes` | Maximum estimated PCIe transfer bytes for one request |
+| `maxTemperatureCelsius` | Maximum GPU temperature, with zero disabling the limit |
+| `batchPowerLimitPercent` | Batch throttle threshold as a percentage of the NVML power limit |
+| `encryptSwap` | Use authenticated encryption for SSD swap |
+| `zeroWipe` | Clear released RAM, device blocks, and logical swap ranges |
+
+Priority comes from server-side model registration. Registrations on the
+same CUDA device share a scheduler. A higher priority request can preempt
+a lower priority request at its next transformer layer checkpoint.
+The resource gate runs before the first forward pass. When required health
+telemetry is unavailable at initialization, the model uses CPU/RAM/SSD.
+Temperature and batch power limits reject work when the device exceeds
+the configured policy.
+
+Run the GPU governance test with the same TinyStories fixture directory
+used by the standalone test.
+
+```powershell
+python tests/native-aot-governance.py <published-exe> <model-assets-directory> <report-directory> --expect-nvml
+```
+
 ## Retrieval-Augmented Generation
 
 RAG uses registered embedding and chat models. The same Monolith bearer token,

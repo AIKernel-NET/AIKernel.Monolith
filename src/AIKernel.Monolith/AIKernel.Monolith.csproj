@@ -21,6 +21,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="AIKernel.Monolith.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="$(AIKernelKernelProject)" Condition="Exists('$(AIKernelKernelProject)')" />
     <PackageReference Include="AIKernel.Kernel" Version="$(AIKernelKernelPackageVersion)"
                       Condition="!Exists('$(AIKernelKernelProject)') and '$(AIKernelKernelPackageVersion)' != ''" />
