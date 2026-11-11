@@ -37,6 +37,8 @@ internal sealed class RagService(
         new(400, "index_limit_exceeded", "An index can contain at most 64 documents and 256 chunks.");
     private static readonly InferenceError InvalidQuery =
         new(400, "invalid_query", "Provide a non-empty query of up to 4000 characters and a topK between 1 and 10.");
+    private static readonly InferenceError InvalidSearchMode =
+        new(400, "invalid_search_mode", "Use vector or hybrid for searchMode.");
     private static readonly InferenceError InvalidFilter =
         new(400, "invalid_filter", "Filter lists must contain 1 to 64 valid document IDs or source strings.");
     private static readonly InferenceError MissingIndex =
@@ -348,7 +350,8 @@ internal sealed class RagService(
 
     internal Task<InferenceOutcome<RagSearchResponse>> SearchAsync(
         string indexId, RagSearchRequest request, string requestId, CancellationToken cancellationToken)
-        => RetrieveAsync(indexId, request.Query, request.TopK, request.Filter, requestId, "rag.search", cancellationToken);
+        => RetrieveAsync(indexId, request.Query, request.TopK, request.Filter, request.SearchMode, requestId,
+            "rag.search", cancellationToken);
 
     internal async Task<InferenceOutcome<RagAnswerResponse>> AnswerAsync(
         string indexId, RagAnswerRequest request, string requestId, CancellationToken cancellationToken)
@@ -374,7 +377,7 @@ internal sealed class RagService(
             return new(Error: InferenceErrors.InvalidRequest);
         }
 
-        var retrieval = await RetrieveAsync(indexId, request.Question, request.TopK, request.Filter, requestId,
+        var retrieval = await RetrieveAsync(indexId, request.Question, request.TopK, request.Filter, request.SearchMode, requestId,
             "rag.answer.retrieve", cancellationToken);
         if (retrieval.Error is { } retrievalError)
         {
@@ -401,7 +404,7 @@ internal sealed class RagService(
     }
 
     private async Task<InferenceOutcome<RagSearchResponse>> RetrieveAsync(
-        string indexId, string? query, int? topK, RagFilter? filter, string requestId, string operation,
+        string indexId, string? query, int? topK, RagFilter? filter, string? searchMode, string requestId, string operation,
         CancellationToken cancellationToken)
     {
         if (!IsValidIndexId(indexId))
@@ -412,6 +415,11 @@ internal sealed class RagService(
         if (string.IsNullOrWhiteSpace(query) || query.Length > 4000 || topK is < 1 or > 10)
         {
             return new(Error: InvalidQuery);
+        }
+
+        if (searchMode is not (null or "vector" or "hybrid"))
+        {
+            return new(Error: InvalidSearchMode);
         }
 
         if ((filter?.DocumentIds is { } ids &&
@@ -462,6 +470,7 @@ internal sealed class RagService(
             return new(Error: InvalidVectors);
         }
 
+        var keywords = searchMode == "hybrid" ? new RagKeywordQuery(query) : null;
         var scored = new List<(RagChunk Chunk, double Score)>(candidates.Length);
         foreach (var chunk in candidates)
         {
@@ -477,9 +486,12 @@ internal sealed class RagService(
                 dotProduct += (double)vector[i] * chunk.Vector[i];
             }
 
-            if (dotProduct > 0)
+            var cosine = dotProduct > 0
+                ? Math.Min(1, dotProduct / Math.Sqrt(queryMagnitude * MagnitudeSquared(chunk.Vector)))
+                : 0;
+            var score = keywords?.Combine(chunk, cosine) ?? cosine;
+            if (score > 0)
             {
-                var score = Math.Min(1, dotProduct / Math.Sqrt(queryMagnitude * MagnitudeSquared(chunk.Vector)));
                 scored.Add((chunk, score));
             }
         }

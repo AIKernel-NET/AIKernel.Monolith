@@ -122,7 +122,7 @@ request budget, Core policy checks, and inference audit apply.
 | `GET /v1/rag/indexes/{indexId}/documents` | No body | Index ID and document summaries with IDs, titles, sources, and chunk counts |
 | `PUT /v1/rag/indexes/{indexId}/documents` | `{"id":"handbook","title":"Updated handbook","text":"The office closes at 19:00."}` | Add or replace one document and return the current index counts |
 | `DELETE /v1/rag/indexes/{indexId}/documents?documentId=handbook` | No body. URL-encode the document ID in the query string. | Delete one document and return the current index counts |
-| `POST /v1/rag/indexes/{indexId}/search` | `{"query":"When does the office close?","topK":3}` | Ranked hits with citation labels, source metadata, chunk text, and cosine scores |
+| `POST /v1/rag/indexes/{indexId}/search` | `{"query":"When does the office close?","topK":3}` | Ranked hits with citation labels, source metadata, chunk text, and retrieval scores |
 | `POST /v1/rag/indexes/{indexId}/answer` | `{"model":"chat","question":"When does the office close?","topK":3}` | Completion ID, chat model ID, answer text, and the source chunks supplied to the model |
 
 Use registered model IDs in place of `embed` and `chat`. Document IDs must
@@ -154,6 +154,21 @@ allowing up to ten. The answer endpoint passes the same ranked chunks to the
 chat model as evidence and asks it to cite them using labels such as `[1]`.
 The response's `sources` map these labels to the evidence supplied to the
 model. An answer request with no matching chunks returns `422 no_context`.
+
+Search and answer accept `"searchMode": "hybrid"` to combine vector similarity
+and exact keyword matches. The default `"vector"` mode ranks by positive
+cosine similarity. Hybrid mode measures coverage of the distinct query terms
+in each chunk's text, document title, and document ID. It compares whole
+tokens without regard to case and keeps internal hyphens, underscores, periods,
+and slashes in identifiers such as `ZX-42`.
+
+The hybrid score combines positive cosine similarity with twice the keyword
+coverage and divides by three. If the query contains a term with both letters
+and digits, the upper half of the score range is reserved for chunks with an
+exact match to such a term. This lets an exact model number rank above a
+semantically similar prefix match. Chunks can qualify through either signal.
+Hybrid mode uses the stored text and embeddings and applies the same filters
+before ranking. It works with both buffered and streaming answers.
 
 Both search and answer accept an optional `filter` object. For example, a
 filtered search body can select a document ID and its registered source.

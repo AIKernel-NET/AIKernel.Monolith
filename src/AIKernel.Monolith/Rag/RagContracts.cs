@@ -11,8 +11,8 @@ internal sealed record RagIndexListResponse(string[] Indexes);
 internal sealed record RagDocumentListResponse(string IndexId, RagDocumentSummary[] Documents);
 internal sealed record RagDocumentSummary(string DocumentId, string? Title, string? Source, int ChunkCount);
 
-internal sealed record RagSearchRequest(string? Query, int? TopK, RagFilter? Filter);
-internal sealed record RagAnswerRequest(string? Model, string? Question, int? TopK, RagFilter? Filter, bool? Stream);
+internal sealed record RagSearchRequest(string? Query, int? TopK, RagFilter? Filter, string? SearchMode);
+internal sealed record RagAnswerRequest(string? Model, string? Question, int? TopK, RagFilter? Filter, bool? Stream, string? SearchMode);
 internal sealed record RagAnswerContext(string Model, ChatMessage[] Messages, RagHit[] Sources);
 internal sealed record RagAnswerSources(string Id, string Model, RagHit[] Sources);
 

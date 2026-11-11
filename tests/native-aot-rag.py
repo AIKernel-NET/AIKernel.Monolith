@@ -26,8 +26,13 @@ KEY = "native-rag-test-only-key"
 INDEXES = "/v1/rag/indexes"
 INDEX = INDEXES + "/handbook"
 ARCHIVE = INDEXES + "/archive"
+PARTS = INDEXES + "/parts"
 DOCUMENTS = INDEX + "/documents"
 QUESTION = "What is the orbital period?"
+PART_QUESTION = "型番zx-42の保守コードは？"
+EXACT_PART = "型番ZX-42専用。保守コードは K7 です。"
+NEAR_PART = "型番ZX-420専用。保守コードは K8 です。"
+SEMANTIC_PART = "交換部品については保守窓口にお問い合わせください。"
 FACT = "The orbital period of the example planet is 37 days."
 OTHER = "The accounting office closes at noon."
 ANSWER = "The orbital period is 37 days [1]."
@@ -73,7 +78,9 @@ def smoke(exe, output):
                     vectors = {PREFIX.strip(): [1, 1, 0], FACT: [3, 0, 0], OTHER: [-2, 0, 0],
                                QUESTION: [2, 0, 0], "No matches": [0, 0, 1], "zero vector": [0, 0, 0],
                                FAILED_CHUNK: [0, 1, 0], UPDATED_FACT: [4, 0, 0],
-                               BACKUP_FACT: [1, 1, 0], EXTRA_FACT: [1, 2, 0]}
+                               BACKUP_FACT: [1, 1, 0], EXTRA_FACT: [1, 2, 0],
+                               PART_QUESTION: [1, 0, 0], EXACT_PART: [-1, 0, 0],
+                               NEAR_PART: [1, 0, 0], SEMANTIC_PART: [3, 1, 0]}
                     self.send_json(200, {"data": [{"index": i, "embedding": vectors[texts[i]]}
                                                  for i in reversed(range(len(texts)))]})
                     return
@@ -82,7 +89,7 @@ def smoke(exe, output):
                 assert body["model"] == "upstream-chat"
                 system, user = body["messages"]
                 assert system["role"] == "system" and "citation labels" in system["content"]
-                assert user["role"] == "user" and user["content"].endswith("\n\nQuestion:\n" + QUESTION)
+                assert user["role"] == "user" and user["content"].endswith("\n\nQuestion:\n" + expected_question)
                 evidence = json.loads(user["content"].split("\n", 1)[1].split("\n\nQuestion:", 1)[0])
                 assert evidence == expected_evidence
                 if body.get("stream"):
@@ -195,6 +202,7 @@ def smoke(exe, output):
                 route = DOCUMENTS + "?" + urlencode({"documentId": document_id})
                 return request(port, route, None, status, "DELETE", key)
 
+            expected_question = QUESTION
             query = {"query": QUESTION}
             question = {"model": "chat", "question": QUESTION, "topK": 1}
             docs = [{"id": "planet", "title": "Planet handbook", "source": "https://example.test/planet",
@@ -398,6 +406,41 @@ def smoke(exe, output):
                     after_delete = request(port, INDEX + "/answer", {**question, "topK": 2}, 200)
                     assert after_delete["sources"] == remaining and after_delete["answer"] == expected_answer
 
+                    part_docs = [
+                        {"id": "exact", "source": "https://example.test/parts/zx-42", "text": EXACT_PART},
+                        {"id": "near", "source": "https://example.test/parts/zx-420", "text": NEAR_PART},
+                        {"id": "semantic", "text": SEMANTIC_PART},
+                    ]
+                    request(port, PARTS, {"embeddingModel": "embed", "documents": part_docs}, 200, "PUT")
+                    part_query = {"query": PART_QUESTION, "topK": 3}
+                    vector_hits = request(port, PARTS + "/search", part_query, 200)["hits"]
+                    assert [hit["source"]["documentId"] for hit in vector_hits] == ["near", "semantic"]
+                    assert request(port, PARTS + "/search", {**part_query, "searchMode": "vector"}, 200)["hits"] == vector_hits
+
+                    hybrid_query = {**part_query, "searchMode": "hybrid"}
+                    hybrid_hits = request(port, PARTS + "/search", hybrid_query, 200)["hits"]
+                    assert [hit["source"]["documentId"] for hit in hybrid_hits] == ["exact", "near", "semantic"]
+                    exact = hybrid_hits[0]
+                    assert exact["citation"] == "[1]" and exact["text"] == EXACT_PART and exact["score"] > 0.5
+                    assert hybrid_hits[1]["score"] <= 0.5 and hybrid_hits[2]["score"] > 0
+
+                    expected_question = PART_QUESTION
+                    expected_evidence = [exact]
+                    expected_answer = "保守コードは K7 です [1]。"
+                    part_question = {"model": "chat", "question": PART_QUESTION, "topK": 1, "searchMode": "hybrid"}
+                    hybrid_answer = request(port, PARTS + "/answer", part_question, 200)
+                    assert hybrid_answer["sources"] == [exact] and hybrid_answer["answer"] == expected_answer
+
+                    filtered_hybrid = {**hybrid_query, "filter": {"documentIds": ["near"]}}
+                    assert [hit["source"]["documentId"] for hit in
+                            request(port, PARTS + "/search", filtered_hybrid, 200)["hits"]] == ["near"]
+                    count = len(calls)
+                    for route, payload in [("/search", hybrid_query), ("/answer", part_question)]:
+                        invalid_mode = request(port, PARTS + route, {**payload, "searchMode": "keyword"}, 400)
+                        assert invalid_mode["error"]["code"] == "invalid_search_mode"
+                    assert len(calls) == count
+                    request(port, PARTS, None, 204, "DELETE")
+
                 write_models("different-upstream-model")
                 with start("model-changed") as port:
                     count = len(calls)
@@ -447,6 +490,10 @@ def smoke(exe, output):
                           "filter_no_matches_skips_provider": True,
                           "rag_sources_before_deltas": True, "rag_streamed_before_upstream_finish": True,
                           "rag_truncated_stream_rejected": True, "rag_early_error_status": 502,
+                          "vector_part_ranking": [hit["source"]["documentId"] for hit in vector_hits],
+                          "hybrid_part_ranking": [hit["source"]["documentId"] for hit in hybrid_hits],
+                          "hybrid_part_answer_sources": [hit["source"]["documentId"] for hit in hybrid_answer["sources"]],
+                          "hybrid_part_answer": hybrid_answer["answer"],
                           "upstream_calls": len(calls), "audit_records": len(entries)}
                 (output / "rag-result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
                 print(json.dumps(result, indent=2))
