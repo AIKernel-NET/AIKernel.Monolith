@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace AIKernel.Monolith.Rag;
 
 internal sealed record RagIndexRequest(string? EmbeddingModel, RagDocument?[]? Documents);
@@ -8,8 +10,11 @@ internal sealed record RagIndexListResponse(string[] Indexes);
 internal sealed record RagDocumentListResponse(string IndexId, RagDocumentSummary[] Documents);
 internal sealed record RagDocumentSummary(string DocumentId, string? Title, string? Source, int ChunkCount);
 
-internal sealed record RagSearchRequest(string? Query, int? TopK);
-internal sealed record RagAnswerRequest(string? Model, string? Question, int? TopK);
+internal sealed record RagSearchRequest(string? Query, int? TopK, RagFilter? Filter);
+internal sealed record RagAnswerRequest(string? Model, string? Question, int? TopK, RagFilter? Filter);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+internal sealed record RagFilter(string?[]? DocumentIds, string?[]? Sources);
 internal sealed record RagSearchResponse(string IndexId, RagHit[] Hits);
 internal sealed record RagAnswerResponse(string Id, string Model, string Answer, RagHit[] Sources);
 

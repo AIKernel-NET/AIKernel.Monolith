@@ -155,6 +155,29 @@ chat model as evidence and asks it to cite them using labels such as `[1]`.
 The response's `sources` map these labels to the evidence supplied to the
 model. An answer request with no matching chunks returns `422 no_context`.
 
+Both search and answer accept an optional `filter` object. For example, a
+filtered search body can select a document ID and its registered source.
+
+```json
+{
+  "query": "When does the office close?",
+  "topK": 3,
+  "filter": {
+    "documentIds": ["handbook"],
+    "sources": ["https://example.com/handbook"]
+  }
+}
+```
+
+The filter uses exact, case-sensitive matches against the stored document ID
+and source string. Values within either list are alternatives. If both lists
+are supplied, a document must match both. Each supplied list must have 1 to
+64 entries. Document IDs use the same validation as indexed IDs, and source
+strings may have up to 2,048 UTF-16 code units. Omitted or null lists impose
+no restriction. Filtering happens before similarity ranking and `topK`.
+When no document matches, search returns an empty `hits` array and answer
+returns `422 no_context`.
+
 ## Container Stack
 
 ```bash

@@ -39,7 +39,7 @@ internal static class RagEndpointExtensions
 
         indexes.MapPost("/search", async (string indexId, RagSearchRequest request, RagService rag,
             HttpContext context, CancellationToken cancellationToken) =>
-            ToResult(await rag.SearchAsync(indexId, request.Query, request.TopK, context.TraceIdentifier, cancellationToken),
+            ToResult(await rag.SearchAsync(indexId, request, context.TraceIdentifier, cancellationToken),
                 RagJsonContext.Default.RagSearchResponse));
 
         indexes.MapPost("/answer", async (string indexId, RagAnswerRequest request, RagService rag,

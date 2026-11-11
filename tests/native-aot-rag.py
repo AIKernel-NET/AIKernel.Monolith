@@ -145,7 +145,7 @@ def smoke(exe, output):
                     if status == 204:
                         assert not data
                         return None
-                    return json.loads(data)
+                    return json.loads(data) if data else None
 
             def put(port, model_id, docs, status=200, key=KEY):
                 return request(port, INDEX, {"embeddingModel": model_id, "documents": docs}, status, "PUT", key)
@@ -256,7 +256,41 @@ def smoke(exe, output):
                         "documentId": "planet", "title": update["title"], "source": update["source"], "chunkCount": 1,
                     }
 
+                    def filtered_search(criteria, **options):
+                        return request(port, INDEX + "/search", {**query, **options, "filter": criteria}, 200)["hits"]
+
+                    by_id = filtered_search({"documentIds": [BACKUP_ID, "almanac"]})
+                    assert [hit["text"] for hit in by_id] == [BACKUP_FACT, EXTRA_FACT]
+                    lowest = filtered_search({"documentIds": ["almanac"]}, topK=1)
+                    assert [(hit["citation"], hit["text"]) for hit in lowest] == [("[1]", EXTRA_FACT)]
+
+                    allowed_sources = [backup["source"], update["source"]]
+                    by_source = filtered_search({"sources": allowed_sources})
+                    assert [hit["text"] for hit in by_source] == [UPDATED_FACT, BACKUP_FACT]
+
+                    criteria = {"documentIds": ["almanac", BACKUP_ID], "sources": allowed_sources}
+                    matching = filtered_search(criteria, topK=1)
+                    assert [(hit["citation"], hit["source"]["documentId"], hit["text"]) for hit in matching] == [
+                        ("[1]", BACKUP_ID, BACKUP_FACT),
+                    ]
+                    expected_evidence = matching
+                    expected_answer = "The calendar records an orbital period of 53 days [1]."
+                    filtered_answer = request(port, INDEX + "/answer", {**question, "filter": criteria}, 200)
+                    assert filtered_answer["sources"] == matching and filtered_answer["answer"] == expected_answer
+
                     count = len(calls)
+                    no_match = {"documentIds": ["planet"], "sources": [backup["source"]]}
+                    assert filtered_search(no_match) == []
+                    assert filtered_search({"sources": [backup["source"].upper()]}) == []
+                    no_context = request(port, INDEX + "/answer", {**question, "filter": no_match}, 422)
+                    assert no_context["error"]["code"] == "no_context"
+                    for invalid in ({"documentIds": []}, {"documentIds": [" "]}, {"sources": [None]},
+                                    {"sources": ["x" * 2049]}, {"documentIds": ["planet"] * 65}):
+                        bad_filter = request(port, INDEX + "/search", {**query, "filter": invalid}, 400)
+                        assert bad_filter["error"]["code"] == "invalid_filter"
+                    request(port, INDEX + "/answer", {**question, "filter": {"source": backup["source"]}}, 400)
+                    assert len(calls) == count
+
                     assert delete(port, "planet")["documentCount"] == 3
                     assert delete(port, "planet", 404)["error"]["code"] == "document_not_found"
                     listed_after_delete = [doc["documentId"] for doc in list_documents(port)]
@@ -332,6 +366,10 @@ def smoke(exe, output):
                           "listed_documents_after_delete": listed_after_delete,
                           "listed_indexes_after_delete": indexes_after_delete,
                           "deleted_index_search_and_answer_rejected": True,
+                          "filtered_search_documents": [hit["source"]["documentId"] for hit in matching],
+                          "filtered_answer_sources": [hit["source"]["documentId"] for hit in filtered_answer["sources"]],
+                          "filtered_answer": filtered_answer["answer"],
+                          "filter_no_matches_skips_provider": True,
                           "upstream_calls": len(calls), "audit_records": len(entries)}
                 (output / "rag-result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
                 print(json.dumps(result, indent=2))

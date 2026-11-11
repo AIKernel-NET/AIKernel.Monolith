@@ -14,6 +14,7 @@ internal sealed class RagService(
 {
     private const int ChunkLength = 1000;
     private const int MaxDocuments = 64;
+    private const int MaxSourceLength = 2048;
     private const int MaxChunks = 256;
     private const int BatchSize = 32;
 
@@ -36,6 +37,8 @@ internal sealed class RagService(
         new(400, "index_limit_exceeded", "An index can contain at most 64 documents and 256 chunks.");
     private static readonly InferenceError InvalidQuery =
         new(400, "invalid_query", "Provide a non-empty query of up to 4000 characters and a topK between 1 and 10.");
+    private static readonly InferenceError InvalidFilter =
+        new(400, "invalid_filter", "Filter lists must contain 1 to 64 valid document IDs or source strings.");
     private static readonly InferenceError MissingIndex =
         new(404, "index_not_found", "The requested RAG index does not exist.");
     private static readonly InferenceError EmbeddingChanged =
@@ -344,8 +347,8 @@ internal sealed class RagService(
     }
 
     internal Task<InferenceOutcome<RagSearchResponse>> SearchAsync(
-        string indexId, string? query, int? topK, string requestId, CancellationToken cancellationToken)
-        => RetrieveAsync(indexId, query, topK, requestId, "rag.search", cancellationToken);
+        string indexId, RagSearchRequest request, string requestId, CancellationToken cancellationToken)
+        => RetrieveAsync(indexId, request.Query, request.TopK, request.Filter, requestId, "rag.search", cancellationToken);
 
     internal async Task<InferenceOutcome<RagAnswerResponse>> AnswerAsync(
         string indexId, RagAnswerRequest request, string requestId, CancellationToken cancellationToken)
@@ -355,7 +358,7 @@ internal sealed class RagService(
             return new(Error: InferenceErrors.InvalidRequest);
         }
 
-        var retrieval = await RetrieveAsync(indexId, request.Question, request.TopK, requestId,
+        var retrieval = await RetrieveAsync(indexId, request.Question, request.TopK, request.Filter, requestId,
             "rag.answer.retrieve", cancellationToken);
         if (retrieval.Error is { } retrievalError)
         {
@@ -385,7 +388,8 @@ internal sealed class RagService(
     }
 
     private async Task<InferenceOutcome<RagSearchResponse>> RetrieveAsync(
-        string indexId, string? query, int? topK, string requestId, string operation, CancellationToken cancellationToken)
+        string indexId, string? query, int? topK, RagFilter? filter, string requestId, string operation,
+        CancellationToken cancellationToken)
     {
         if (!IsValidIndexId(indexId))
         {
@@ -395,6 +399,14 @@ internal sealed class RagService(
         if (string.IsNullOrWhiteSpace(query) || query.Length > 4000 || topK is < 1 or > 10)
         {
             return new(Error: InvalidQuery);
+        }
+
+        if ((filter?.DocumentIds is { } ids &&
+                (ids.Length is 0 or > MaxDocuments || ids.Any(id => !IsValidDocumentId(id)))) ||
+            (filter?.Sources is { } sources &&
+                (sources.Length is 0 or > MaxDocuments || sources.Any(source => source is null or { Length: > MaxSourceLength }))))
+        {
+            return new(Error: InvalidFilter);
         }
 
         var current = await LoadIndexAsync(indexId, cancellationToken);
@@ -414,6 +426,16 @@ internal sealed class RagService(
             return new(Error: EmbeddingChanged);
         }
 
+        var candidates = filter is null
+            ? index.Chunks
+            : index.Chunks.Where(chunk =>
+                (filter.DocumentIds is null || filter.DocumentIds.Contains(chunk.Source.DocumentId, StringComparer.Ordinal)) &&
+                (filter.Sources is null || filter.Sources.Contains(chunk.Source.Source, StringComparer.Ordinal))).ToArray();
+        if (candidates.Length == 0)
+        {
+            return new(Value: new RagSearchResponse(indexId, []));
+        }
+
         var embeddings = await inference.EmbedAsync(index.EmbeddingModel.Id, [query], requestId, cancellationToken, operation);
         if (embeddings.Error is { } error)
         {
@@ -427,8 +449,8 @@ internal sealed class RagService(
             return new(Error: InvalidVectors);
         }
 
-        var scored = new List<(RagChunk Chunk, double Score)>(index.Chunks.Length);
-        foreach (var chunk in index.Chunks)
+        var scored = new List<(RagChunk Chunk, double Score)>(candidates.Length);
+        foreach (var chunk in candidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (vector.Length != chunk.Vector.Length)
@@ -517,7 +539,7 @@ internal sealed class RagService(
         {
             if (document is not { Id: not null, Text.Length: > 0 and <= ChunkLength * MaxChunks } ||
                 !IsValidDocumentId(document.Id) || string.IsNullOrWhiteSpace(document.Text) ||
-                document.Title?.Length > 512 || document.Source?.Length > 2048 || !ids.Add(document.Id))
+                document.Title?.Length > 512 || document.Source?.Length > MaxSourceLength || !ids.Add(document.Id))
             {
                 return null;
             }
