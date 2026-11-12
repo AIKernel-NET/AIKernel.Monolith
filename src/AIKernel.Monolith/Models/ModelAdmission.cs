@@ -3,16 +3,12 @@ using AIKernel.Abstractions.Governance;
 using AIKernel.Common.Results;
 using AIKernel.Core.Governance;
 using AIKernel.Kernel.Governance;
-using AIKernel.Kernel.Memory;
 using AIKernel.Monolith.Models.Local;
 
 namespace AIKernel.Monolith.Models;
 
-internal sealed class ModelAdmission(IDecisionGate gate, PagedLlamaPool localModels)
+internal sealed class ModelAdmission(IDecisionGate gate, PagedLlamaPool localModels, CudaTopology topology)
 {
-    private readonly Lock topologyLock = new();
-    private readonly Dictionary<int, string> pciByOrdinal = [];
-
     internal async Task<ModelAdmissionStatus> ReadAsync(RegisteredModel model, string requestId, CancellationToken token)
     {
         var operation = model.Metadata.Kind == "embedding" ? "embeddings" : "chat.completions";
@@ -31,22 +27,25 @@ internal sealed class ModelAdmission(IDecisionGate gate, PagedLlamaPool localMod
         ReadLocal(PagedLlamaSettings settings, PagedLlamaPlacement? placement, CancellationToken token)
     {
         using var telemetry = NvmlDeviceTelemetry.Open().Value;
-        var count = CudaVirtualMemoryDevice.GetDeviceCount();
+        var visibleDevices = topology.PciBusIds;
         var ordinal = placement is null ? settings.Device : placement.Device;
         var sampled = new Dictionary<int, DeviceAdmission>();
-        for (var index = 0; index < count.Value; index++)
+        if (visibleDevices is not null)
         {
-            token.ThrowIfCancellationRequested();
-            sampled.Add(index, ReadDevice(index, settings, telemetry, placement));
+            for (var index = 0; index < visibleDevices.Length; index++)
+            {
+                token.ThrowIfCancellationRequested();
+                sampled.Add(index, ReadDevice(index, visibleDevices[index], settings, telemetry, placement));
+            }
         }
 
-        if (ordinal is int current && !sampled.ContainsKey(current) && (placement is not null || !count.IsSuccess))
-            sampled.Add(current, ReadDevice(current, settings, telemetry, placement));
+        if (ordinal is int current && !sampled.ContainsKey(current) && (placement is not null || visibleDevices is null))
+            sampled.Add(current, ReadDevice(current, null, settings, telemetry, placement));
 
         var devices = sampled.Values.Select(device => device.Status).ToArray();
-        if (ordinal is null || !sampled.TryGetValue(ordinal.Value, out var source) || source.Available == false)
+        if (ordinal is null || !sampled.TryGetValue(ordinal.Value, out var source))
             return ("cpu", null, null, null, devices);
-        if (source.Available is null)
+        if (!source.Available)
             return ("unknown", ordinal, null, "cuda_device_unavailable", devices);
 
         var limits = settings.GetHealthLimits(ordinal.Value);
@@ -71,11 +70,12 @@ internal sealed class ModelAdmission(IDecisionGate gate, PagedLlamaPool localMod
         return ("cuda", ordinal, ordinal, source.ExecutionError, devices);
     }
 
-    private DeviceAdmission ReadDevice(int ordinal, PagedLlamaSettings settings, NvmlDeviceTelemetry? telemetry,
-        PagedLlamaPlacement? placement)
+    private static DeviceAdmission ReadDevice(int ordinal, string? pci, PagedLlamaSettings settings,
+        NvmlDeviceTelemetry? telemetry, PagedLlamaPlacement? placement)
     {
         var active = placement?.Device == ordinal;
-        var (available, pci) = active && placement!.PciBusId is { } knownPci ? (true, knownPci) : ProbeDevice(ordinal);
+        if (active && placement!.PciBusId is { } knownPci)
+            pci = knownPci;
         var limits = settings.GetHealthLimits(ordinal);
         var targetLimits = settings.GetHealthLimits(ordinal, migrationTarget: true);
         var allowed = settings.ThermalMigrationDevices?.Contains(ordinal) ?? true;
@@ -87,40 +87,14 @@ internal sealed class ModelAdmission(IDecisionGate gate, PagedLlamaPool localMod
         var status = new GpuAdmissionStatus(ordinal, pci, health.IsSuccess ? health.Value.TemperatureCelsius : null,
             limits.MaximumTemperatureCelsius, targetLimits.MaximumTemperatureCelsius, allowed,
             allowed && target.IsSuccess, health.Error?.Code);
-        return new(active ? true : available, execution.Error?.Code, status);
-    }
-
-    private (bool? Available, string? Pci) ProbeDevice(int ordinal)
-    {
-        lock (topologyLock)
-        {
-            if (pciByOrdinal.TryGetValue(ordinal, out var cached))
-                return (true, cached);
-
-            try
-            {
-                using var device = CudaVirtualMemoryDevice.TryCreate(ordinal, out _);
-                if (device is null)
-                    return (false, null);
-
-                var pci = device.GetPciBusId();
-                if (pci is not null)
-                    pciByOrdinal.Add(ordinal, pci);
-                return (true, pci);
-            }
-            catch (Exception error) when (error is DllNotFoundException or EntryPointNotFoundException or
-                BadImageFormatException or InvalidOperationException or NotSupportedException or OutOfMemoryException)
-            {
-                return (null, null);
-            }
-        }
+        return new(active || pci is not null, execution.Error?.Code, status);
     }
 
     private static string? CredentialError(RegisteredModel model) =>
         model.ApiKeyEnvironmentVariable is { } variable && string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(variable))
             ? "credential_unavailable" : null;
 
-    private sealed record DeviceAdmission(bool? Available, string? ExecutionError, GpuAdmissionStatus Status);
+    private sealed record DeviceAdmission(bool Available, string? ExecutionError, GpuAdmissionStatus Status);
 }
 
 internal sealed record ModelAdmissionStatus(

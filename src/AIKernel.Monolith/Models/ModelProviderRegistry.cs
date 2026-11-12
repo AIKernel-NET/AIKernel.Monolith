@@ -91,6 +91,8 @@ public sealed class ModelProviderRegistry
     public IReadOnlyList<ModelMetadata> ListModels()
         => models.Values.Select(x => x.Metadata).OrderBy(x => x.Id, StringComparer.Ordinal).ToArray();
 
+    internal bool HasLocalModels => models.Values.Any(model => model.Local is not null);
+
     internal RegisteredModel? Find(string id) => models.GetValueOrDefault(id);
 
     private static RegisteredModel CreateModel(ModelRegistration registration, string path)

@@ -236,9 +236,11 @@ GPU’s PCI bus ID, NVML temperature, execution limit, and migration target
 limit. A temperature limit of zero disables that temperature check. A null
 temperature means the sample is unavailable. `migration_target_eligible`
 checks the device allowlist and health limits. The actual migration also
-checks available resources and the devices visited by the request. The first
-PCI lookup can briefly open a CUDA context. Subsequent polls reuse the PCI
-mapping and refresh the NVML samples.
+checks available resources and the devices visited by the request. At startup,
+a short-lived process resolves the CUDA PCI mapping without creating a context.
+It exits before Monolith begins listening. Polls reuse the mapping and read
+fresh NVML samples. Use a CUDA driver library that exports
+`ak_get_device_pci_bus_id`.
 
 This `local` registration fragment configures separate limits for two GPUs.
 
