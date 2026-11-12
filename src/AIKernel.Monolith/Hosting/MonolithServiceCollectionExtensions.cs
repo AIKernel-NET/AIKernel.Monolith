@@ -35,6 +35,7 @@ public static class MonolithServiceCollectionExtensions
         services.AddSingleton<PagedLlamaPool>();
         services.AddSingleton<GovernedModelInference>();
         services.AddSingleton<CudaTopology>();
+        services.AddHostedService<CudaTopologyRetryService>();
         services.AddSingleton<ModelAdmission>();
         services.AddSingleton<RagService>();
         services.AddHttpClient(GovernedModelInference.HttpClientName)

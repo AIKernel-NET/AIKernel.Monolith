@@ -106,16 +106,20 @@ def assert_probe_exited(log_path, monolith_pid):
     listening = log.index("Now listening on:")
     assert probe_pid != monolith_pid and exit_code == 0 and probe.end() < listening, log
 
+    assert_process_stopped(probe_pid)
+    return probe_pid
+
+
+def assert_process_stopped(pid):
     kernel = process_api()
-    with_handle = kernel.OpenProcess(0x00100000, False, probe_pid)  # SYNCHRONIZE
+    with_handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
     if with_handle:
         try:
-            assert kernel.WaitForSingleObject(with_handle, 0) == 0, f"CUDA probe {probe_pid} is still running"
+            assert kernel.WaitForSingleObject(with_handle, 0) == 0, f"CUDA probe {pid} is still running"
         finally:
             kernel.CloseHandle(with_handle)
     elif C.get_last_error() != 87:  # ERROR_INVALID_PARAMETER when the PID no longer exists
         raise C.WinError(C.get_last_error())
-    return probe_pid
 
 
 def pci_key(bus_id):
@@ -177,7 +181,7 @@ def measure_queries(counter, pid, query):
     return responses, measurement
 
 
-def send(port, key, method, path, body=None, sent=None):
+def send(port, key, method, path, body=None, sent=None, expected_status=200):
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     with closing(HTTPConnection("127.0.0.1", port, timeout=60)) as connection:
         connection.request(method, path, body, headers)
@@ -185,7 +189,7 @@ def send(port, key, method, path, body=None, sent=None):
             sent()
         response = connection.getresponse()
         payload = json.loads(response.read())
-        assert response.status == 200, (response.status, payload)
+        assert response.status == expected_status, (response.status, payload)
         return payload
 
 
@@ -194,20 +198,86 @@ def admission(port, key, name, sent=None):
     return send(port, key, "GET", path, sent=sent)
 
 
+FAULT_PROBE_MARKER = re.compile(r"CUDA probe fault fixture ready pid=([0-9]+) devices=([0-9]+)")
+
+
 def wait_for_fault_probe(process, log_path):
-    marker = re.compile(r"CUDA probe fault fixture ready pid=([0-9]+) devices=([0-9]+)")
     deadline = time.monotonic() + 25
     while process.poll() is None and time.monotonic() < deadline:
         log = log_path.read_text(encoding="utf-8", errors="replace")
         assert "Now listening on:" not in log, log
-        if match := marker.search(log):
+        if match := FAULT_PROBE_MARKER.search(log):
             assert int(match[2]) >= 2, log
             return int(match[1])
         time.sleep(0.05)
     raise RuntimeError(log_path.read_text(encoding="utf-8", errors="replace"))
 
 
-def verify_probe_fault(process, log_path, helpers, key, fault):
+def assert_unavailable(statuses):
+    for ordinal, status in enumerate(statuses):
+        assert not status["admissible"] and status["reason"] == "cuda_device_unavailable", status
+        assert status["backend"] == "unknown" and status["admission_device"] is None, status
+        assert [gpu["device"] for gpu in status["devices"]] == [ordinal], status
+        gpu = status["devices"][0]
+        assert not gpu["migration_target_eligible"] and gpu["pci_bus_id"] is None, gpu
+        assert gpu["temperature_celsius"] is None, gpu
+
+
+def verify_probe_recovery(counter, process, log_path, port, key, first_probe_pid, release_path):
+    deadline = time.monotonic() + 30
+    while process.poll() is None and time.monotonic() < deadline:
+        log = log_path.read_text(encoding="utf-8")
+        retries = [int(pid) for pid, _ in FAULT_PROBE_MARKER.findall(log) if int(pid) != first_probe_pid]
+        if retries:
+            assert_unavailable([admission(port, key, name) for name in ("first", "second")])
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError(f"Monolith did not start another CUDA probe: {log_path.read_text(encoding='utf-8')}")
+
+    release_path.touch()
+
+    def query_models(first_sent):
+        first = admission(port, key, "first", sent=first_sent)
+        deadline = time.monotonic() + 30
+        while True:
+            second = admission(port, key, "second")
+            if first["admissible"] and second["admissible"]:
+                break
+            assert process.poll() is None and time.monotonic() < deadline, (first, second)
+            time.sleep(0.05)
+            first = admission(port, key, "first")
+
+        for _ in range(5):
+            admission(port, key, "first")
+            admission(port, key, "second")
+            time.sleep(0.05)
+        return first, second
+
+    (first, second), measurement = measure_queries(counter, process.pid, query_models)
+    for ordinal, status in enumerate((first, second)):
+        assert status["backend"] == "cuda" and status["reason"] is None, status
+        assert status["device"] == status["admission_device"] == ordinal, status
+    devices = verify_devices(first)
+    verify_devices(second)
+    assert process.poll() is None
+
+    log = log_path.read_text(encoding="utf-8")
+    assert log.count("Now listening on:") == 1, log
+    probe_pids = [int(pid) for pid, _ in FAULT_PROBE_MARKER.findall(log)]
+    assert len(probe_pids) >= 2 and probe_pids[0] == first_probe_pid, log
+    assert f"CUDA topology probe process {probe_pids[-1]} exited with code 0." in log, log
+    for pid in probe_pids:
+        assert_process_stopped(pid)
+    probe_vram = {pid: sum(counter.sample(pid).values()) for pid in probe_pids}
+    assert all(used == 0 for used in probe_vram.values()), probe_vram
+    return {
+        "monolith_pid": process.pid, "probe_pids": probe_pids, "probe_vram_bytes": probe_vram,
+        "dedicated_vram": measurement, "devices": devices, "model_statuses": [first, second],
+    }
+
+
+def verify_probe_fault(process, log_path, helpers, key, fault, release_path, prompt):
     probe_pid = wait_for_fault_probe(process, log_path)
     assert probe_pid != process.pid
     kernel = process_api()
@@ -251,6 +321,10 @@ def verify_probe_fault(process, log_path, helpers, key, fault):
             def query_models(first_sent):
                 first = admission(port, key, "first", sent=first_sent)
                 second = admission(port, key, "second")
+                for name in ("first", "second"):
+                    rejection = send(port, key, "POST", "/v1/completions",
+                                     json.dumps({"model": name, "prompt": prompt}), expected_status=503)
+                    assert rejection["error"]["code"] == "cuda_device_unavailable", rejection
                 for _ in range(5):
                     admission(port, key, "first")
                     admission(port, key, "second")
@@ -258,21 +332,16 @@ def verify_probe_fault(process, log_path, helpers, key, fault):
                 return first, second
 
             statuses, measurement = measure_queries(counter, process.pid, query_models)
-            for ordinal, status in enumerate(statuses):
-                assert not status["admissible"] and status["reason"] == "cuda_device_unavailable", status
-                assert status["backend"] == "unknown" and status["admission_device"] is None, status
-                assert [gpu["device"] for gpu in status["devices"]] == [ordinal], status
-                for gpu in status["devices"]:
-                    assert not gpu["migration_target_eligible"] and gpu["pci_bus_id"] is None, gpu
-                    assert gpu["temperature_celsius"] is None, gpu
+            assert_unavailable(statuses)
             probe_after_queries = sum(counter.sample(probe_pid).values())
             assert probe_after_queries == 0, probe_after_queries
+            recovery = verify_probe_recovery(counter, process, log_path, port, key, probe_pid, release_path)
             return {
                 "fault": fault, "monolith_pid": process.pid, "probe_pid": probe_pid,
                 "probe_exit_code": exit_code.value, "probe_exited_before_listen": True,
                 "probe_vram_before_fault_by_adapter": before,
                 "probe_vram_after_exit_bytes": probe_after, "probe_vram_after_queries_bytes": probe_after_queries,
-                "dedicated_vram": measurement, "model_statuses": statuses,
+                "dedicated_vram": measurement, "model_statuses": statuses, "recovery": recovery,
             }
     finally:
         if kernel.WaitForSingleObject(handle, 0) == 0x102:
@@ -317,6 +386,7 @@ def test(exe, assets, output, fault_library=None, fault=None):
                    Logging__LogLevel__Microsoft__Hosting__Lifetime="Information")
         env["Logging__LogLevel__AIKernel.Monolith.Models.CudaTopology"] = "Debug"
         executable = exe
+        release_path = work / "release-probe"
         if fault is not None:
             executable = work / exe.name
             shutil.copyfile(exe, executable)
@@ -325,6 +395,7 @@ def test(exe, assets, output, fault_library=None, fault=None):
             real_driver = work / "aikernel_cuda_driver.real.dll"
             shutil.copyfile(exe.with_name("aikernel_cuda_driver.dll"), real_driver)
             env["AIKERNEL_TEST_REAL_CUDA_LIBRARY"] = str(real_driver)
+            env["AIKERNEL_TEST_PROBE_RELEASE_FILE"] = str(release_path)
 
         log_path = output / "monolith.log"
         with log_path.open("wb") as log:
@@ -334,8 +405,12 @@ def test(exe, assets, output, fault_library=None, fault=None):
                 cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
             try:
                 if fault is not None:
-                    report = verify_probe_fault(process, log_path, helpers, key, fault)
-                    assert not (mounts["config"] / "inference-audit.jsonl").exists()
+                    report = verify_probe_fault(process, log_path, helpers, key, fault, release_path,
+                                                standalone["PROMPT"])
+                    records = helpers["audit_entries"](mounts["config"] / "inference-audit.jsonl")
+                    assert [row["Description"] for row in records if row["EventType"] == "inference.rejected"] == [
+                        "cuda_device_unavailable", "cuda_device_unavailable"]
+                    assert all(row["EventType"] != "inference.execution" for row in records)
                     assert not (mounts["config"] / "model-swap").exists()
                     report["native_sha256"] = native_sha256
                     write_report(output, report)
@@ -387,6 +462,8 @@ def test(exe, assets, output, fault_library=None, fault=None):
                 }
                 write_report(output, report)
             finally:
+                if fault is not None:
+                    release_path.touch(exist_ok=True)
                 if process.poll() is None:
                     process.terminate()
                     process.wait(timeout=15)

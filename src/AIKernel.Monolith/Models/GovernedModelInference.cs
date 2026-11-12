@@ -19,6 +19,7 @@ internal sealed class GovernedModelInference(
     IAuditEventWriter audit,
     IHttpClientFactory clients,
     PagedLlamaPool localModels,
+    CudaTopology topology,
     ILogger<GovernedModelInference> logger)
 {
     internal const string HttpClientName = "monolith-inference";
@@ -161,6 +162,9 @@ internal sealed class GovernedModelInference(
             T? value;
             if (model.Local is { } local)
             {
+                if (topology.PciBusIds is null)
+                    return await RejectAsync(InferenceErrors.CudaDeviceUnavailable);
+
                 var result = await executeLocal!(local, metadata, cancellationToken);
                 if (result.IsFailure)
                 {
@@ -269,6 +273,8 @@ internal static class InferenceErrors
         new(400, "context_length_exceeded", "The prompt exceeds the configured local model context.");
     internal static readonly InferenceError UnsupportedLocalModel =
         new(422, "unsupported_model_format", "The local model format or encoding is unsupported.");
+    internal static readonly InferenceError CudaDeviceUnavailable =
+        new(503, "cuda_device_unavailable", "The CUDA device inventory is unavailable.");
     internal static readonly InferenceError LocalMemoryExhausted =
         new(503, "local_memory_exhausted", "The local model could not allocate memory.");
     internal static readonly InferenceError InvalidEmbeddingRequest =

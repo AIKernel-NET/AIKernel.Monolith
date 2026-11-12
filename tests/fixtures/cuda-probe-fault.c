@@ -48,8 +48,17 @@ __declspec(dllexport) int32_t ak_get_device_count(int32_t *count)
                 fprintf(stderr, "CUDA probe fault fixture ready pid=%lu devices=%ld\n",
                     GetCurrentProcessId(), (long)*count);
                 fflush(stderr);
-                // Bound the fixture's lifetime even if the test runner stops.
-                Sleep(30000);
+                wchar_t release[32768];
+                DWORD release_length = GetEnvironmentVariableW(L"AIKERNEL_TEST_PROBE_RELEASE_FILE",
+                    release, ARRAYSIZE(release));
+                ULONGLONG deadline = GetTickCount64() + 30000;
+                while (GetTickCount64() < deadline)
+                {
+                    if (release_length > 0 && release_length < ARRAYSIZE(release) &&
+                        GetFileAttributesW(release) != INVALID_FILE_ATTRIBUTES)
+                        ExitProcess(0);
+                    Sleep(50);
+                }
                 status = 1;
             }
         }

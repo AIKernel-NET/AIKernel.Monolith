@@ -46,7 +46,7 @@ internal sealed class ModelAdmission(IDecisionGate gate, PagedLlamaPool localMod
         if (ordinal is null || !sampled.TryGetValue(ordinal.Value, out var source))
             return ("cpu", null, null, null, devices);
         if (!source.Available)
-            return ("unknown", ordinal, null, "cuda_device_unavailable", devices);
+            return ("unknown", ordinal, null, InferenceErrors.CudaDeviceUnavailable.Code, devices);
 
         var limits = settings.GetHealthLimits(ordinal.Value);
         if (limits == default)

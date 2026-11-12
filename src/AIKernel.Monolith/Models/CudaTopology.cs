@@ -10,8 +10,11 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
 {
     internal const string ProbeArgument = "--probe-cuda-topology";
 
-    // A null inventory means enumeration failed. An empty inventory means no CUDA devices.
-    internal string?[]? PciBusIds { get; private set; }
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
+    private string?[]? pciBusIds;
+
+    // A null inventory means enumeration is unavailable. An empty inventory means no CUDA devices.
+    internal string?[]? PciBusIds => Volatile.Read(ref pciBusIds);
 
     internal static string?[]? Probe()
     {
@@ -28,8 +31,20 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
         return ids;
     }
 
-    internal async Task InitializeAsync()
+    internal async Task RetryUntilAvailableAsync(CancellationToken stoppingToken)
     {
+        while (PciBusIds is null)
+        {
+            await Task.Delay(RetryDelay, stoppingToken);
+            await InitializeAsync(stoppingToken);
+            if (PciBusIds is not null)
+                logger.LogInformation("CUDA device enumeration recovered.");
+        }
+    }
+
+    internal async Task InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
         // A short-lived process releases the CUDA driver's per-process GPU memory before the host accepts requests.
         if (Environment.ProcessPath is not { } executable)
             return;
@@ -50,18 +65,22 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
             if (process is null)
                 return;
 
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(15));
             var output = process.StandardOutput.ReadToEndAsync(timeout.Token);
             try
             {
-                await process.WaitForExitAsync(timeout.Token);
+                await Task.WhenAll(process.WaitForExitAsync(timeout.Token), output);
                 logger.LogDebug("CUDA topology probe process {ProcessId} exited with code {ExitCode}.",
                     process.Id, process.ExitCode);
-                var json = await output;
-                if (process.ExitCode == 0)
-                    PciBusIds = JsonSerializer.Deserialize(json, InferenceJsonContext.Default.CudaPciBusIds);
+                if (process.ExitCode != 0)
+                    return;
+
+                var inventory = JsonSerializer.Deserialize(await output, InferenceJsonContext.Default.CudaPciBusIds);
+                if (inventory is not null && inventory.All(static pci => !string.IsNullOrWhiteSpace(pci)))
+                    Volatile.Write(ref pciBusIds, inventory);
             }
-            catch (OperationCanceledException)
+            finally
             {
                 if (!process.HasExited)
                 {
@@ -69,12 +88,21 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
                     catch (InvalidOperationException) when (process.HasExited) { }
                     await process.WaitForExitAsync();
                 }
-                logger.LogWarning("CUDA device enumeration timed out.");
             }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            logger.LogWarning("CUDA device enumeration timed out.");
         }
         catch (Exception error) when (error is Win32Exception or InvalidOperationException or IOException or JsonException)
         {
             logger.LogWarning(error, "CUDA device enumeration failed.");
         }
     }
+}
+
+internal sealed class CudaTopologyRetryService(CudaTopology topology, ModelProviderRegistry registry) : BackgroundService
+{
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+        => registry.HasLocalModels ? topology.RetryUntilAvailableAsync(stoppingToken) : Task.CompletedTask;
 }

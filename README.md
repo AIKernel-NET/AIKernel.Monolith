@@ -282,7 +282,13 @@ To also exercise an abnormal probe exit and a probe timeout, build the fixture
 from an x64 Native Tools Command Prompt and pass the DLL to the regression.
 The fixture uses the real CUDA driver and waits after writing the PCI mapping.
 The test checks that Monolith starts with GPU admission unavailable and both
-the probe process and its VRAM are released.
+the probe process and its VRAM are released. It then allows a background
+retry to finish and checks that admission and NVML temperatures recover in
+the same process, with zero dedicated VRAM during queries.
+
+After a failed startup probe, Monolith waits five seconds between attempts.
+Each attempt has a 15-second timeout. Until a complete CUDA inventory is
+available, local inference returns HTTP 503 with `cuda_device_unavailable`.
 
 ```bat
 cl /nologo /LD /MT tests/fixtures/cuda-probe-fault.c /link /OUT:cuda-probe-fault.dll
