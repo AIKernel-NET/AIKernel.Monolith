@@ -55,6 +55,8 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
             try
             {
                 await process.WaitForExitAsync(timeout.Token);
+                logger.LogDebug("CUDA topology probe process {ProcessId} exited with code {ExitCode}.",
+                    process.Id, process.ExitCode);
                 var json = await output;
                 if (process.ExitCode == 0)
                     PciBusIds = JsonSerializer.Deserialize(json, InferenceJsonContext.Default.CudaPciBusIds);

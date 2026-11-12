@@ -267,6 +267,17 @@ used by the standalone test.
 python tests/native-aot-governance.py <published-exe> <model-assets-directory> <report-directory> --expect-nvml
 ```
 
+Run the Windows admission VRAM regression with the same fixtures, a regular
+Native AOT publication, an RTX 4000 and T1000, NVML, and `nvidia-smi` on
+`PATH`. The test checks that the CUDA probe exits before Monolith listens
+and that the Windows dedicated GPU memory counter stays at 0 B before,
+during, and after the initial admission queries. It also runs inference on
+both adapters to verify that the counter detects allocations.
+
+```powershell
+python tests/native-aot-admission-vram.py <published-exe> <model-assets-directory> <report-directory>
+```
+
 The Native AOT console project in `tests/AIKernel.Monolith.ThermalTests`
 uses two physical CUDA devices and live NVML data. It injects over-limit
 temperature samples during generation to check migration and refusal
