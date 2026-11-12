@@ -24,7 +24,7 @@ parser.add_argument("checkpoint", type=Path, help="OpenLLaMA 3B v2 Q4_0 GGUF wit
 parser.add_argument("output", type=Path, help="new report directory")
 parser.add_argument("--devices", type=int, nargs=2, metavar=("SOURCE", "TARGET"), default=(0, 1))
 parser.add_argument("--scenario", choices=("cancel", "reuse-rejection"), default="cancel",
-    help="run repeated cancellation or reject a warm migration destination and retry after cooling")
+    help="run repeated cancellation or check thermal rejections during execution and admission before recovery")
 parser.add_argument("--limit", type=int, default=78, help="real NVML temperature threshold in Celsius")
 parser.add_argument("--device-limits", type=int, nargs=4,
     metavar=("SOURCE_RUN", "SOURCE_REUSE", "TARGET_RUN", "TARGET_REUSE"),
@@ -460,6 +460,13 @@ def wait_until(predicate, seconds, description):
         time.sleep(.025)
 
 
+def rejected_for_reuse_limit(record):
+    temperature = int(record.get("gpu_migration_last_thermal_rejection_temperature_celsius", 0))
+    return (record.get("gpu_migration_last_thermal_rejection_pci") == source and
+        record.get("gpu_migration_last_thermal_rejection_limit_celsius") == str(source_reuse) and
+        source_reuse < temperature <= source_limit)
+
+
 def reuse_rejection():
     folder = args.output / "monolith"
     evidence = report["reuse_rejection"] = {"model": "thermal", "nvml": [], "lead": {}, "follower": {}}
@@ -495,7 +502,6 @@ def reuse_rejection():
             target_arm.touch()
             print(json.dumps({"event": "heating_current_gpu", "nvml": temperatures(), "pid": app.pid}), flush=True)
             wait_until(lambda: bool(execution_rows()), 145, "the lead terminal audit")
-            source_stop.touch()
             lead_thread.join(15)
             assert not lead_thread.is_alive(), "Lead client did not receive the rejection"
             evidence["lead_audit"] = rejected = execution_rows()[0]
@@ -513,9 +519,7 @@ def reuse_rejection():
                 "no_eligible_destination": rejected["Description"] == "device_thermal_migration_unavailable" and
                     lead.get("error", {}).get("code") == "device_thermal_migration_unavailable" and
                     record.get("cuda_device_ordinal") == str(target_ordinal) and "gpu_migrations" not in record,
-                "rejection_uses_reuse_limit": bool(hot_window) and source_reuse < rejected_temp <= source_limit and
-                    record.get("gpu_migration_last_thermal_rejection_pci") == source and
-                    record.get("gpu_migration_last_thermal_rejection_limit_celsius") == str(source_reuse),
+                "rejection_uses_reuse_limit": bool(hot_window) and rejected_for_reuse_limit(record),
                 "destination_has_sufficient_vram": bool(hot_window) and
                     all(free is not None and free >= configured_vram for _, _, _, free in hot_window),
                 "rejected_request_releases_kv": allocated > 0 and
@@ -525,6 +529,44 @@ def reuse_rejection():
             print(json.dumps({"event": "rejected", "checks": rejection_checks, "temperature": rejected_temp,
                 "kv_freed_bytes": allocated}), flush=True)
             assert all(rejection_checks.values()), rejection_checks
+
+            def ready_for_admission_rejection():
+                now = time.time()
+                recent = [row for row in samples[-30:] if now - row[0] < .12]
+                if len(recent) < 5 or not all(source_reuse < src <= source_limit and dst > target_limit
+                        for _, src, dst, _ in recent):
+                    return False
+                source_temp, target_temp = temperatures()
+                if source_reuse < source_temp <= source_limit and target_temp > target_limit:
+                    evidence["admission_rejection_nvml"] = [source_temp, target_temp]
+                    return True
+                return False
+
+            intermediate = evidence["admission_rejection"] = {}
+            with closing(HTTPConnection("127.0.0.1", port, timeout=25)) as admission_client:
+                admission_client.connect()
+                wait_until(ready_for_admission_rejection, min(args.cooldown_timeout, 60),
+                    "a hot current GPU and a destination still in the rejection band")
+                request(admission_client, evidence["model"], "Once", intermediate)
+            wait_until(lambda: len(execution_rows()) >= 2, 5, "the admission rejection audit")
+            evidence["admission_rejection_audit"] = refused = execution_rows()[1]
+            record = refused["Metadata"]
+            # The resource gate and KV creation follow the thermal check at admission.
+            evidence["admission_rejection_checks"] = admission_checks = {
+                "rejected_at_admission": intermediate.get("http") == 503 and
+                    intermediate.get("error", {}).get("code") == "device_thermal_migration_unavailable" and
+                    refused["Description"] == "device_thermal_migration_unavailable" and
+                    record.get("cuda_device_ordinal") == str(target_ordinal) and
+                    "device_temperature_celsius" not in record and "resource_minimum_vram_blocks" not in record and
+                    "gpu_migrations" not in record and not intermediate["events"],
+                "warm_destination_rejected_again": rejected_for_reuse_limit(record),
+                "no_kv_allocated_at_admission": "kv_cuda_vram_bytes_before_dispose" not in record and not swaps(config),
+            }
+            print(json.dumps({"event": "admission_rejected", "checks": admission_checks,
+                "nvml": evidence["admission_rejection_nvml"],
+                "temperature": record.get("gpu_migration_last_thermal_rejection_temperature_celsius")}), flush=True)
+            assert all(admission_checks.values()), admission_checks
+            source_stop.touch()
 
             def ready_to_recover():
                 source_temp, target_temp = temperatures()
@@ -546,14 +588,14 @@ def reuse_rejection():
             target_stop.touch()
             follower_thread.join(330)
             assert not follower_thread.is_alive(), "Recovery request did not complete"
-            wait_until(lambda: len(execution_rows()) >= 2, 5, "the recovery terminal audit")
-            evidence["recovery_audit"] = recovered = execution_rows()[1]
+            wait_until(lambda: len(execution_rows()) >= 3, 5, "the recovery terminal audit")
+            evidence["recovery_audit"] = recovered = execution_rows()[2]
             record = recovered["Metadata"]
             evidence["remaining_swap"] = swaps(config)
             evidence["checks"] = {
                 "same_process_same_model": app.poll() is None and
-                    recovered["Subject"] == rejected["Subject"] == evidence["model"] and
-                    record["request_id"] != rejected["Metadata"]["request_id"],
+                    recovered["Subject"] == refused["Subject"] == rejected["Subject"] == evidence["model"] and
+                    len({row["Metadata"]["request_id"] for row in (rejected, refused, recovered)}) == 3,
                 "cooled_destination_accepted": evidence.get("return_context_seen", False) and
                     record.get("gpu_migration_from_pci") == target and record.get("gpu_migration_to_pci") == source and
                     record.get("cuda_device_ordinal") == str(source_ordinal) and

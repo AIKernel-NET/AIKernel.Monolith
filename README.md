@@ -285,10 +285,12 @@ python tests/native-aot-thermal-cancel.py <published-exe> <openllama-gguf> <repo
 ```
 
 The test checks the NVML temperature used to reject device 0 and verifies
-that the rejected request releases its KV allocations and SSD swap. After
-device 0 cools to 62 °C or below, the same model ID must migrate and finish
-in the same process. Its output, finish reason, and prefill and forward
-counts must match an isolated run on device 0.
+that the first request releases its KV allocations and SSD swap. While device 1
+is still above 77 °C and device 0 remains in the rejection band, a second request
+to the same model ID must receive HTTP 503 during admission, before the resource
+gate and KV allocation. After device 0 cools to 62 °C or below, a third request
+to that model ID must migrate and finish in the same process. Its output, finish
+reason, and prefill and forward counts must match an isolated run on device 0.
 
 ## Retrieval-Augmented Generation
 
