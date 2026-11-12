@@ -77,6 +77,20 @@ internal sealed class GovernedModelInference(
 
     internal static string CreateCompletionId() => $"cmpl-{Guid.CreateVersion7():N}";
 
+    internal static async Task<(bool Allowed, GateDecisionKind Decision)> EvaluatePolicyAsync(
+        IDecisionGate gate, RegisteredModel model, string operation, string requestId, CancellationToken cancellationToken)
+    {
+        var decision = await gate.EvaluateAsync(new DecisionGateRequest
+        {
+            OperationId = operation,
+            CorrelationId = requestId,
+            GateInput = model.Policy
+        }, cancellationToken);
+
+        return (decision is { Succeeded: true, Accepted: true, DecisionKind: GateDecisionKind.Allow },
+            decision.DecisionKind);
+    }
+
     private static InferenceError? ValidateMessages(IReadOnlyList<ChatMessage>? messages)
         => messages is { Count: > 0 } && messages.All(message => message is
             { Role: "system" or "developer" or "user" or "assistant", Content: not null })
@@ -119,15 +133,8 @@ internal sealed class GovernedModelInference(
             return await RejectAsync(inputError);
         }
 
-        var decision = await gate.EvaluateAsync(new DecisionGateRequest
-        {
-            OperationId = operation,
-            CorrelationId = requestId,
-            GateInput = model.Policy
-        }, cancellationToken);
-
-        var allowed = decision is { Succeeded: true, Accepted: true, DecisionKind: GateDecisionKind.Allow };
-        metadata["decision"] = decision.DecisionKind.ToString();
+        var (allowed, decision) = await EvaluatePolicyAsync(gate, model, operation, requestId, cancellationToken);
+        metadata["decision"] = decision.ToString();
         metadata["logos"] = model.Policy.Logos.ToString();
         metadata["ethos"] = model.Policy.Ethos.ToString();
         metadata["pathos"] = model.Policy.Pathos.ToString();
@@ -218,12 +225,11 @@ internal sealed class GovernedModelInference(
                 {
                     "unsupported_model_format" => InferenceErrors.UnsupportedLocalModel,
                     "local_memory_exhausted" => InferenceErrors.LocalMemoryExhausted,
-                    "device_temperature_exceeded" or "device_thermal_migration_unavailable"
-                        => new InferenceError(503, reason, "The configured local inference route is unavailable.",
-                            RetryAfterSeconds: InferenceErrors.ThermalRetryAfterSeconds),
                     "resource_budget_exceeded" or "resource_pcie_budget_exceeded" or "device_queue_full" or
-                    "device_power_throttled" or "device_telemetry_unavailable" or "device_thermal_migration_failed"
-                        => new InferenceError(503, reason, "The configured local inference route is unavailable."),
+                    "device_temperature_exceeded" or "device_thermal_migration_unavailable" or "device_power_throttled" or
+                    "device_telemetry_unavailable" or "device_thermal_migration_failed"
+                        => new InferenceError(503, reason, "The configured local inference route is unavailable.",
+                            InferenceErrors.GetRetryAfterSeconds(reason)),
                     _ => InferenceErrors.ProviderFailed
                 })
                 : new(Error: InferenceErrors.AuditUnavailable);
@@ -252,7 +258,10 @@ internal sealed record InferenceError(int Status, string Code, string Message, i
 internal static class InferenceErrors
 {
     // Advise clients when to check again without estimating the GPU's cooling time.
-    internal const int ThermalRetryAfterSeconds = 5;
+    private const int ThermalRetryAfterSeconds = 5;
+
+    internal static int? GetRetryAfterSeconds(string? code) =>
+        code is "device_temperature_exceeded" or "device_thermal_migration_unavailable" ? ThermalRetryAfterSeconds : null;
 
     internal static readonly InferenceError InvalidRequest =
         new(400, "invalid_request", "A model ID and valid text messages are required.");
@@ -264,6 +273,8 @@ internal static class InferenceErrors
         new(503, "local_memory_exhausted", "The local model could not allocate memory.");
     internal static readonly InferenceError InvalidEmbeddingRequest =
         new(400, "invalid_request", "Provide one to 2048 non-empty texts and use float encoding.");
+    internal static readonly InferenceError ModelIdRequired =
+        new(400, "invalid_request", "Supply exactly one model ID.");
     internal static readonly InferenceError ModelNotFound =
         new(404, "model_not_found", "The requested model is not registered.");
     internal static readonly InferenceError PolicyDenied =

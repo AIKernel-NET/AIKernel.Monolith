@@ -21,8 +21,13 @@ internal sealed class PagedLlamaPool(ILogger<PagedLlamaModel> logger) : IDisposa
         await session.Lock.WaitAsync(token);
         try
         {
-            session.Model ??= new PagedLlamaModel(settings, token, logger: logger);
-            return Result<string>.Success(await session.Model.GenerateAsync(messages, emit, audit, null, token,
+            var model = session.Model;
+            if (model is null)
+            {
+                model = new PagedLlamaModel(settings, token, logger: logger);
+                Volatile.Write(ref session.Model, model);
+            }
+            return Result<string>.Success(await model.GenerateAsync(messages, emit, audit, null, token,
                 schedulerForDevice: GetScheduler));
         }
         catch (InferenceGovernanceException ex)
@@ -54,6 +59,9 @@ internal sealed class PagedLlamaPool(ILogger<PagedLlamaModel> logger) : IDisposa
         }
     }
 
+    internal PagedLlamaPlacement? GetPlacement(string id)
+        => sessions.TryGetValue(id, out var session) ? Volatile.Read(ref session.Model)?.Placement : null;
+
     private LayerQosScheduler GetScheduler(int ordinal) => devices.GetOrAdd(ordinal, static _ => new());
 
     public void Dispose()
@@ -74,9 +82,11 @@ internal sealed class PagedLlamaPool(ILogger<PagedLlamaModel> logger) : IDisposa
     private sealed class Session
     {
         internal SemaphoreSlim Lock { get; } = new(1);
-        internal PagedLlamaModel? Model { get; set; }
+        internal PagedLlamaModel? Model;
     }
 }
+
+internal sealed record PagedLlamaPlacement(int? Device, string? PciBusId = null, bool RecoveryPending = false);
 
 internal sealed record PagedLlamaSettings(string Checkpoint, string? Tokenizer, string? Config, string SwapDirectory,
     int BlockSize, int RamBlocks, int VramBlocks, int Device, int ContextTokens, int MaxNewTokens,

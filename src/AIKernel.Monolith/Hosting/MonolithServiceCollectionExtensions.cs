@@ -34,6 +34,7 @@ public static class MonolithServiceCollectionExtensions
         services.AddSingleton<IAuditEventWriter, FileInferenceAuditWriter>();
         services.AddSingleton<PagedLlamaPool>();
         services.AddSingleton<GovernedModelInference>();
+        services.AddSingleton<ModelAdmission>();
         services.AddSingleton<RagService>();
         services.AddHttpClient(GovernedModelInference.HttpClientName)
             .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });

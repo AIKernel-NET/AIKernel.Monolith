@@ -6,6 +6,7 @@ using AIKernel.Monolith.OpenAI;
 namespace AIKernel.Monolith.Internal;
 
 [JsonSerializable(typeof(ModelRegistration))]
+[JsonSerializable(typeof(ModelAdmissionStatus))]
 [JsonSerializable(typeof(AuditEvent))]
 [JsonSerializable(typeof(OpenAIErrorResponse))]
 [JsonSerializable(typeof(EmbeddingApiRequest))]

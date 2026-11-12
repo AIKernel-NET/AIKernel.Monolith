@@ -25,7 +25,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
     private string? pciBusId;
     private int deviceOrdinal;
     private DeviceHealthLimits activeHealthLimits;
-    private bool thermalPlacementUnavailable;
+    private PagedLlamaPlacement placement = new(null);
     private readonly bool telemetryFallback;
     private readonly long parameters;
     private readonly int quantizationBits;
@@ -103,6 +103,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
                         {
                             weights.Load(legacy, shape.Matrices, token);
                         }
+                        placement = new(cuda is null ? null : deviceOrdinal, cuda is null ? null : pciBusId);
                     }
                     catch
                     {
@@ -128,6 +129,14 @@ internal sealed partial class PagedLlamaModel : IDisposable
             mapped?.Dispose();
             throw;
         }
+    }
+
+    internal PagedLlamaPlacement Placement => Volatile.Read(ref placement);
+
+    private void SetRecoveryPending(bool pending)
+    {
+        if (placement.RecoveryPending != pending)
+            Volatile.Write(ref placement, placement with { RecoveryPending = pending });
     }
 
     internal async Task<string> GenerateAsync(IReadOnlyList<ChatMessage> messages, Func<string, Task> emit,
@@ -177,7 +186,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
         {
             var currentHealth = CheckHealth(pciBusId, activeHealthLimits);
             DeviceHealthSnapshot health;
-            if (thermalPlacementUnavailable && currentHealth.Error?.Code == "device_temperature_exceeded"
+            if (Placement.RecoveryPending && currentHealth.Error?.Code == "device_temperature_exceeded"
                 && schedulerForDevice is not null)
             {
                 health = Migrate(0, layer: null);
@@ -197,7 +206,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
         var gate = ResultStep<InferenceResourceRequest, InferenceResourceEstimate>.FromResult(request,
             Admission.Evaluate(request, budget));
         var estimate = Require(gate.ToResult());
-        thermalPlacementUnavailable = false;
+        SetRecoveryPending(false);
         audit["resource_minimum_ram_blocks"] = estimate.MinimumRamBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
         audit["resource_minimum_vram_blocks"] = estimate.MinimumVramBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
         audit["resource_estimated_pcie_bytes"] = estimate.EstimatedPcieBytes.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -323,6 +332,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
                     execution.Lease = targetLease;
                     targetLease = null;
                     accepted = true;
+                    Volatile.Write(ref placement, placement with { Device = ordinal, PciBusId = targetPci });
                     visitedDevices.Add(targetPci);
                     visitedOrdinals.Add(ordinal);
                     migrations++;
@@ -344,7 +354,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
                 catch (OperationCanceledException) when (token.IsCancellationRequested)
                 {
                     canceled = true;
-                    thermalPlacementUnavailable = true;
+                    SetRecoveryPending(true);
                     audit["gpu_migration_canceled_stage"] = stage;
                     audit["gpu_migration_canceled_from_pci"] = previousPci;
                     if (targetPci is not null) audit["gpu_migration_canceled_to_pci"] = targetPci;
@@ -366,7 +376,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
                 }
             }
 
-            thermalPlacementUnavailable = true;
+            SetRecoveryPending(true);
             throw new InferenceGovernanceException(new ErrorContext("No other permitted CUDA device meets the thermal and resource limits.",
                 "device_thermal_migration_unavailable", true) { FailureKind = FailureKind.FailClosed });
         }

@@ -19,6 +19,20 @@ public static class OpenAIEndpointExtensions
                 registry.ListModels().Select(x => new ModelObject(x.Id, "model", x.Provider)).ToArray()),
             MonolithJsonContext.Default.ModelsResponse));
 
+        endpoints.MapGet("/v1/models/admission", async (HttpContext context, ModelProviderRegistry registry,
+            ModelAdmission admission, CancellationToken cancellationToken) =>
+        {
+            context.Response.Headers.CacheControl = "no-store";
+            var query = context.Request.Query["model"];
+            if (query.Count != 1 || string.IsNullOrWhiteSpace(query[0]))
+                return ErrorResponse(InferenceErrors.ModelIdRequired);
+            if (registry.Find(query[0]!) is not { } model)
+                return ErrorResponse(InferenceErrors.ModelNotFound);
+
+            var status = await admission.ReadAsync(model, context.TraceIdentifier, cancellationToken);
+            return Results.Json(status, InferenceJsonContext.Default.ModelAdmissionStatus);
+        });
+
         endpoints.MapPost("/v1/completions", async (CompletionRequest request, HttpContext context,
             GovernedModelInference inference, CancellationToken cancellationToken) =>
         {

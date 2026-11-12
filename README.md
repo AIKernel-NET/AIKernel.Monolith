@@ -221,6 +221,25 @@ streaming has already started, the SSE error event carries the same JSON
 field. The value is a polling interval. GPU eligibility is checked again
 when the client retries.
 
+Use `GET /v1/models/admission?model=<model-id>` with the Monolith bearer token
+to check a model without starting inference. A registered model returns
+HTTP 200 with `admissible`, a `reason` when blocked, and `retry_after_seconds`
+for thermal denials. An unregistered model returns HTTP 404. The response is
+a fresh snapshot of the model policy and route. Prompt-dependent resource
+admission and GPU lease acquisition happen when an inference request arrives.
+
+For a local model, `device` is the current CUDA ordinal or the configured
+ordinal before the first load. `admission_device` is the GPU the health gate
+would choose, including an eligible recovery target after a failed migration.
+Both fields are null on a CPU route. The `devices` array reports each visible
+GPU’s PCI bus ID, NVML temperature, execution limit, and migration target
+limit. A temperature limit of zero disables that temperature check. A null
+temperature means the sample is unavailable. `migration_target_eligible`
+checks the device allowlist and health limits. The actual migration also
+checks available resources and the devices visited by the request. The first
+PCI lookup can briefly open a CUDA context. Subsequent polls reuse the PCI
+mapping and refresh the NVML samples.
+
 This `local` registration fragment configures separate limits for two GPUs.
 
 ```json
