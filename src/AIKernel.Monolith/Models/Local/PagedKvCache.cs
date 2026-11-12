@@ -22,7 +22,7 @@ internal sealed class PagedKvCache : IDisposable
     private int headOffset;
     private bool values;
 
-    internal PagedKvCache(LlamaCheckpoint shape, PagedLlamaSettings settings, CudaVirtualMemoryDevice? cuda,
+    internal PagedKvCache(LlamaCheckpoint shape, PagedLlamaSettings settings, CudaVirtualMemoryDevice.AllocationScope? device,
         TransformerCompute compute, VirtualMemorySpace? restored = null)
     {
         this.compute = compute;
@@ -36,7 +36,7 @@ internal sealed class PagedKvCache : IDisposable
         if (restored is not null && (restored.BlockSize != blockSize || restored.BlockCount != expectedBlocks))
             throw new InvalidDataException("The snapshot KV dimensions differ from the model.");
         memory = restored ?? new VirtualMemorySpace(expectedBlocks, blockSize,
-            settings.KvRamBlocks, settings.SwapDirectory, cuda is null ? 0 : settings.KvVramBlocks, cuda,
+            settings.KvRamBlocks, settings.SwapDirectory, device is null ? 0 : settings.KvVramBlocks, device,
             swapPolicy: settings.SwapPolicy);
         scores = new float[shape.Context];
         scaledQuery = new float[shape.HeadSize];
@@ -95,7 +95,7 @@ internal sealed class PagedKvCache : IDisposable
 
     internal Result<int> PrepareDeviceChange(CancellationToken token) => memory.PrepareDeviceChange(token);
 
-    internal Result<bool> BindPreparedDevice(CudaVirtualMemoryDevice device) => memory.BindPreparedDevice(device);
+    internal Result<bool> BindPreparedDevice(CudaVirtualMemoryDevice.AllocationScope device) => memory.BindPreparedDevice(device);
 
     internal void SetCompute(TransformerCompute replacement) => compute = replacement;
 

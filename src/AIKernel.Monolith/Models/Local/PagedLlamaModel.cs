@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using AIKernel.Common.Results;
@@ -18,6 +19,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
     private static readonly ErrorContext HealthUnavailable = new("Required device telemetry is unavailable.",
         "device_telemetry_unavailable", true) { FailureKind = FailureKind.FailClosed };
     private CudaVirtualMemoryDevice? cuda;
+    private CudaVirtualMemoryDevice.AllocationScope? weightAllocations;
     private readonly IDeviceHealthTelemetry? telemetry;
     private readonly NvmlDeviceTelemetry? ownedTelemetry;
     private string? pciBusId;
@@ -86,9 +88,10 @@ internal sealed partial class PagedLlamaModel : IDisposable
                 }
 
                 compute = new TransformerCompute(cuda);
+                weightAllocations = cuda?.CreateAllocationScope();
                 var source = mapped is null ? null : new MappedTensorSource(mapped, shape.Matrices.ToArray());
                 memory = new VirtualMemorySpace(shape.BlockCount, settings.BlockSize, settings.RamBlocks,
-                    settings.SwapDirectory, cuda is null ? 0 : settings.VramBlocks, cuda, source, settings.SwapPolicy);
+                    settings.SwapDirectory, cuda is null ? 0 : settings.VramBlocks, weightAllocations, source, settings.SwapPolicy);
                 try
                 {
                     weights = new PagedLlamaWeights(memory, compute, settings.SwapPolicy.ZeroWipe);
@@ -138,6 +141,8 @@ internal sealed partial class PagedLlamaModel : IDisposable
 
         if (telemetryFallback) audit["device_route"] = "cpu_telemetry_unavailable";
         PagedKvCache? cache = null;
+        CudaVirtualMemoryDevice.AllocationScope? kvAllocations = null;
+        long kvSwapReadsAtMigration = 0;
         HashSet<string>? visitedDevices = null;
         HashSet<int>? visitedOrdinals = null;
         var migrations = 0;
@@ -198,14 +203,14 @@ internal sealed partial class PagedLlamaModel : IDisposable
         var matrixBlocks = weights.MatrixBlocks;
         if (!continuation.FirstLogits.IsEmpty && continuation.FirstLogits.Length != shape.Vocabulary)
             throw new ArgumentException("The logits buffer must match the vocabulary.");
+        if (settings.KvVramBlocks != 0) kvAllocations = cuda?.CreateAllocationScope();
         using var restored = continuation.RestorePath is { } restorePath
             ? Require(VirtualMemorySpace.Restore(restorePath, ramBlocks: settings.KvRamBlocks,
-                vramBlocks: useGpu ? settings.KvVramBlocks : 0, device: cuda,
+                vramBlocks: useGpu ? settings.KvVramBlocks : 0, device: kvAllocations,
                 swapDirectory: settings.SwapDirectory, swapPolicy: settings.SwapPolicy))
             : null;
         if (restored is not null) ValidateContinuation(restored, tokens);
-        using var kv = cache = new PagedKvCache(shape, settings, cuda, compute, restored);
-        using var state = new ForwardState(shape, weights, compute, kv, settings, CheckLayer);
+        var kv = cache = new PagedKvCache(shape, settings, kvAllocations, compute, restored);
         Result<int> Spill()
         {
             if (cache is { } active)
@@ -288,18 +293,23 @@ internal sealed partial class PagedLlamaModel : IDisposable
                     stage = "target_bind";
                     token.ThrowIfCancellationRequested();
                     var targetCompute = new TransformerCompute(candidate);
-                    RequireMigration(memory.BindPreparedDevice(candidate));
-                    if (cache is not null && settings.KvVramBlocks != 0)
+                    var targetWeights = candidate.CreateAllocationScope();
+                    var targetKv = cache is not null && settings.KvVramBlocks != 0 ? candidate.CreateAllocationScope() : null;
+                    RequireMigration(memory.BindPreparedDevice(targetWeights));
+                    if (targetKv is not null)
                     {
-                        var bound = cache.BindPreparedDevice(candidate);
+                        var bound = cache!.BindPreparedDevice(targetKv);
                         if (!bound.IsSuccess)
                         {
-                            RequireMigration(memory.BindPreparedDevice(previous));
+                            RequireMigration(memory.BindPreparedDevice(weightAllocations!));
                             RequireMigration(bound);
                         }
+                        kvSwapReadsAtMigration = cache.Statistics.SwapReads;
                     }
 
                     cuda = candidate;
+                    weightAllocations = targetWeights;
+                    kvAllocations = targetKv;
                     pciBusId = targetPci;
                     deviceOrdinal = ordinal;
                     compute = targetCompute;
@@ -367,78 +377,102 @@ internal sealed partial class PagedLlamaModel : IDisposable
                 AvailableVramBytes = (long)Math.Min((ulong)configuredVram, health.Value.VramFreeBytes)
             }).IsSuccess ? health.Value : null;
         }
-        var decoder = Encoding.UTF8.GetDecoder();
-        var gen2 = GC.CollectionCount(2);
-        var allocated = GC.GetTotalAllocatedBytes(precise: false);
-        long maxStepTicks = 0;
-        if (restored is null)
+        try
         {
-            for (var pos = 0; pos < tokens.Count - 1; pos++)
-                state.Forward(tokens[pos], pos, token);
-        }
-        audit["local_prefill_tokens"] = (restored is null ? tokens.Count - 1 : 0)
-            .ToString(System.Globalization.CultureInfo.InvariantCulture);
-        if (continuation.SavePath is { } savePath)
-        {
-            Span<byte> checkpoint = stackalloc byte[40];
-            WriteContinuation(tokens, checkpoint);
-            Require(kv.Hibernate(savePath, checkpoint, continuation.AllowPlaintext));
-        }
-
-        var position = tokens.Count - 1;
-        var current = tokens[^1];
-        var finish = "length";
-        for (var step = 0; step < maxNewTokens && position < shape.Context; step++, position++)
-        {
-            var stepStarted = Stopwatch.GetTimestamp();
-            state.Forward(current, position, token);
-            var next = state.Predict(token, step == 0 ? continuation.FirstLogits.Span : default);
-            maxStepTicks = Math.Max(maxStepTicks, Stopwatch.GetTimestamp() - stepStarted);
-            if (next is LlamaTokenizer.Begin or LlamaTokenizer.End)
+            using var state = new ForwardState(shape, weights, compute, kv, settings, CheckLayer);
+            var decoder = Encoding.UTF8.GetDecoder();
+            var gen2 = GC.CollectionCount(2);
+            var allocated = GC.GetTotalAllocatedBytes(precise: false);
+            long maxStepTicks = 0;
+            if (restored is null)
             {
-                finish = "stop";
-                break;
+                for (var pos = 0; pos < tokens.Count - 1; pos++)
+                    state.Forward(tokens[pos], pos, token);
+            }
+            audit["local_prefill_tokens"] = (restored is null ? tokens.Count - 1 : 0)
+                .ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (continuation.SavePath is { } savePath)
+            {
+                Span<byte> checkpoint = stackalloc byte[40];
+                WriteContinuation(tokens, checkpoint);
+                Require(kv.Hibernate(savePath, checkpoint, continuation.AllowPlaintext));
             }
 
-            generatedTokens++;
-            var piece = tokenizer.Decode(next, decoder);
-            if (piece.Length > 0)
+            var position = tokens.Count - 1;
+            var current = tokens[^1];
+            var finish = "length";
+            for (var step = 0; step < maxNewTokens && position < shape.Context; step++, position++)
             {
-                await emit(piece);
+                var stepStarted = Stopwatch.GetTimestamp();
+                state.Forward(current, position, token);
+                var next = state.Predict(token, step == 0 ? continuation.FirstLogits.Span : default);
+                maxStepTicks = Math.Max(maxStepTicks, Stopwatch.GetTimestamp() - stepStarted);
+                if (next is LlamaTokenizer.Begin or LlamaTokenizer.End)
+                {
+                    finish = "stop";
+                    break;
+                }
+
+                generatedTokens++;
+                var piece = tokenizer.Decode(next, decoder);
+                if (piece.Length > 0)
+                {
+                    await emit(piece);
+                }
+
+                current = next;
             }
 
-            current = next;
-        }
+            var tail = LlamaTokenizer.Flush(decoder);
+            if (tail.Length > 0)
+            {
+                await emit(tail);
+            }
 
-        var tail = LlamaTokenizer.Flush(decoder);
-        if (tail.Length > 0)
+            var final = memory.GetStatistics();
+            audit["qos_preemptions"] = execution.Preemptions.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["local_forward_layers"] = forwardLayers.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["checkpoint_bytes"] = checkpointBytes.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["weight_blocks"] = shape.BlockCount.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["weight_ram_blocks"] = initial.RamBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["weight_vram_blocks"] = initial.VramBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["weight_swap_blocks"] = initial.SwapBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["weight_swap_reads"] = (final.SwapReads - initial.SwapReads).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["weight_vram_page_ins"] = (final.DevicePageIns - initial.DevicePageIns).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["backend"] = cuda is null ? "cpu" : "cuda";
+            audit["cuda_status"] = cudaStatus.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit[cuda is null ? "cpu_matvec_blocks" : "cuda_matvec_blocks"] =
+                (weights.MatrixBlocks - matrixBlocks).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["mapped_weight_reads"] = (final.BackingReads - initial.BackingReads).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["kv_swap_reads"] = kv.Statistics.SwapReads.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["kv_vram_page_ins"] = kv.Statistics.DevicePageIns.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["generation_gen2_collections"] = (GC.CollectionCount(2) - gen2).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["generation_allocated_bytes"] = (GC.GetTotalAllocatedBytes(precise: false) - allocated)
+                .ToString(System.Globalization.CultureInfo.InvariantCulture);
+            audit["generation_max_step_us"] = ((long)(maxStepTicks * (1_000_000d / Stopwatch.Frequency)))
+                .ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return finish;
+        }
+        finally
         {
-            await emit(tail);
+            var before = kvAllocations?.GetStatistics();
+            var weightsBefore = weightAllocations?.GetStatistics();
+            var swapReads = before.HasValue ? kv.Statistics.SwapReads : 0;
+            kv.Dispose();
+            if (before is { } kvBefore && kvAllocations is { } trackedKv && weightsBefore is { } weightBefore &&
+                weightAllocations is { } trackedWeights)
+            {
+                var kvAfter = trackedKv.GetStatistics();
+                var weightAfter = trackedWeights.GetStatistics();
+                audit["kv_cuda_vram_bytes_before_dispose"] = (kvBefore.AllocatedBytes - kvBefore.ReleasedBytes).ToString(CultureInfo.InvariantCulture);
+                audit["kv_cuda_vram_bytes_released_on_dispose"] = (kvAfter.ReleasedBytes - kvBefore.ReleasedBytes).ToString(CultureInfo.InvariantCulture);
+                audit["kv_cuda_vram_bytes_after_dispose"] = (kvAfter.AllocatedBytes - kvAfter.ReleasedBytes).ToString(CultureInfo.InvariantCulture);
+                audit["weight_cuda_vram_bytes_before_kv_dispose"] = (weightBefore.AllocatedBytes - weightBefore.ReleasedBytes).ToString(CultureInfo.InvariantCulture);
+                audit["weight_cuda_vram_bytes_after_kv_dispose"] = (weightAfter.AllocatedBytes - weightAfter.ReleasedBytes).ToString(CultureInfo.InvariantCulture);
+                if (migrations != 0)
+                    audit["kv_swap_reads_since_migration"] = (swapReads - kvSwapReadsAtMigration).ToString(CultureInfo.InvariantCulture);
+            }
         }
-
-        var final = memory.GetStatistics();
-        audit["qos_preemptions"] = execution.Preemptions.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["local_forward_layers"] = forwardLayers.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["checkpoint_bytes"] = checkpointBytes.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["weight_blocks"] = shape.BlockCount.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["weight_ram_blocks"] = initial.RamBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["weight_vram_blocks"] = initial.VramBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["weight_swap_blocks"] = initial.SwapBlocks.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["weight_swap_reads"] = (final.SwapReads - initial.SwapReads).ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["weight_vram_page_ins"] = (final.DevicePageIns - initial.DevicePageIns).ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["backend"] = cuda is null ? "cpu" : "cuda";
-        audit["cuda_status"] = cudaStatus.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit[cuda is null ? "cpu_matvec_blocks" : "cuda_matvec_blocks"] =
-            (weights.MatrixBlocks - matrixBlocks).ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["mapped_weight_reads"] = (final.BackingReads - initial.BackingReads).ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["kv_swap_reads"] = kv.Statistics.SwapReads.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["kv_vram_page_ins"] = kv.Statistics.DevicePageIns.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["generation_gen2_collections"] = (GC.CollectionCount(2) - gen2).ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["generation_allocated_bytes"] = (GC.GetTotalAllocatedBytes(precise: false) - allocated)
-            .ToString(System.Globalization.CultureInfo.InvariantCulture);
-        audit["generation_max_step_us"] = ((long)(maxStepTicks * (1_000_000d / Stopwatch.Frequency)))
-            .ToString(System.Globalization.CultureInfo.InvariantCulture);
-        return finish;
     }
 
     public void Dispose()
