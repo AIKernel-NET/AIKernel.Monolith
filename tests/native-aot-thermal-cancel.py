@@ -1,8 +1,9 @@
-"""Exercise two real thermal migrations and pre-token disconnects on one model session."""
+"""Verify thermal migration, cancellation, and recovery on real GPUs."""
 import argparse
 from contextlib import ExitStack, closing
 import ctypes as c
 from ctypes import wintypes as w
+from datetime import datetime
 from http.client import HTTPConnection
 import hashlib
 import json
@@ -22,6 +23,8 @@ parser.add_argument("exe", type=Path, help="published Windows Native AOT Monolit
 parser.add_argument("checkpoint", type=Path, help="OpenLLaMA 3B v2 Q4_0 GGUF with an embedded tokenizer")
 parser.add_argument("output", type=Path, help="new report directory")
 parser.add_argument("--devices", type=int, nargs=2, metavar=("SOURCE", "TARGET"), default=(0, 1))
+parser.add_argument("--scenario", choices=("cancel", "reuse-rejection"), default="cancel",
+    help="run repeated cancellation or reject a warm migration destination and retry after cooling")
 parser.add_argument("--limit", type=int, default=78, help="real NVML temperature threshold in Celsius")
 parser.add_argument("--device-limits", type=int, nargs=4,
     metavar=("SOURCE_RUN", "SOURCE_REUSE", "TARGET_RUN", "TARGET_REUSE"),
@@ -41,6 +44,8 @@ if not (1 <= source_reuse <= source_limit <= 82 and 1 <= target_reuse <= target_
     parser.error("limit must be 3..82 °C and arm-after must be 0..90 seconds")
 if not 1 <= args.cooldown_timeout <= 300 or not 0 <= args.return_margin < source_reuse:
     parser.error("cooldown-timeout must be 1..300 seconds and return-margin must be below the limit")
+if args.scenario == "reuse-rejection" and (not args.device_limits or source_reuse >= source_limit):
+    parser.error("reuse-rejection requires --device-limits and SOURCE_REUSE below SOURCE_RUN")
 thermal_limits = [
     {"device": source_ordinal, "maxTemperatureCelsius": source_limit, "maxMigrationTargetTemperatureCelsius": source_reuse},
     {"device": target_ordinal, "maxTemperatureCelsius": target_limit, "maxMigrationTargetTemperatureCelsius": target_reuse},
@@ -104,7 +109,7 @@ def fingerprint(path):
 report = {"binary_sha256": helpers["native_image"](exe), "bridge_sha256": fingerprint(bridgedll),
     "checkpoint_sha256": fingerprint(checkpoint),
     "gpus": [{"ordinal": ordinal, "pci": p, "name": n} for ordinal, (_, p, n) in zip(args.devices, devices)],
-    "thermal_limits": thermal_limits, "return_margin": args.return_margin, "cycles": []}
+    "thermal_limits": thermal_limits, "return_margin": args.return_margin, "scenario": args.scenario, "cycles": []}
 if not args.device_limits:
     report["threshold"] = args.limit
 args.output.mkdir(parents=True, exist_ok=True)
@@ -155,7 +160,13 @@ def start_worker(fn, *args):
     return thread
 
 
-def launch(folder, stack, baseline=False):
+WEIGHT_BLOCK_BYTES = 32 * 1024 * 1024
+WEIGHT_VRAM_BLOCKS = 8
+KV_VRAM_BLOCKS = 26
+KV_PAGE_BYTES = 64 * 1024
+
+
+def launch(folder, stack, baseline=False, initial_device=None):
     folder.mkdir()
     tmp = stack.enter_context(tempfile.TemporaryDirectory(dir=folder))
     paths = {kind: Path(tmp) / kind for kind in ("model", "config", "vfs", "capability")}
@@ -166,8 +177,9 @@ def launch(folder, stack, baseline=False):
         os.link(checkpoint, model_path)
     except OSError:
         shutil.copyfile(checkpoint, model_path)
-    local = {"checkpoint": checkpoint.name, "device": source_ordinal, "blockSize": 33554432,
-        "ramBlocks": 8, "vramBlocks": 8, "kvRamBlocks": 2, "kvVramBlocks": 26, "contextTokens": 64,
+    local = {"checkpoint": checkpoint.name, "device": source_ordinal if initial_device is None else initial_device,
+        "blockSize": WEIGHT_BLOCK_BYTES, "ramBlocks": 8, "vramBlocks": WEIGHT_VRAM_BLOCKS,
+        "kvRamBlocks": 2, "kvVramBlocks": KV_VRAM_BLOCKS, "contextTokens": 64,
         "maxNewTokens": 3,
         "encryptSwap": True, "zeroWipe": True, "thermalMigrationDevices": list(args.devices)}
     if args.device_limits and not baseline:
@@ -206,7 +218,7 @@ def swaps(config):
     return result
 
 
-def heater(folder, stack, ordinal, preheat=False):
+def heater(folder, stack, ordinal, preheat=False, *, preheat_margin=2, hold=None):
     prefix, pci = ("source", source) if ordinal == source_ordinal else ("target", target)
     limit = source_limit if ordinal == source_ordinal else target_limit
     ready, arm, stop = [(folder / (prefix + "-" + name)).resolve() for name in ("ready", "arm", "stop")]
@@ -217,7 +229,9 @@ def heater(folder, stack, ordinal, preheat=False):
     if preheat:
         command.append("--preheat")
         if args.device_limits:
-            command.extend(["--preheat-celsius", str(min(target_reuse - 1, target_limit - 2))])
+            command.extend(["--preheat-celsius", str(max(0, min(target_reuse - 1, target_limit - preheat_margin)))])
+    if hold is not None:
+        command.extend(["--hold-celsius", str(hold)])
     process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
     stack.callback(stop_process, process)
     return ready, arm, stop
@@ -426,6 +440,140 @@ def complete(outcome):
     return outcome.get("http") == 200 and "error" not in outcome and outcome["events"][-1:] == ["done"]
 
 
+class NvmlMemoryInfo(c.Structure):
+    _fields_ = [(name, c.c_uint64) for name in ("total", "free", "used")]
+
+
+def sample_reuse_temperatures(samples, stop):
+    memory = NvmlMemoryInfo()
+    while not stop.is_set():
+        free = memory.free if nvml.nvmlDeviceGetMemoryInfo(devices[0][0], c.byref(memory)) == 0 else None
+        samples.append([time.time(), *temperatures(), free])
+        stop.wait(.009)
+
+
+def wait_until(predicate, seconds, description):
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Timed out waiting for {description}. NVML temperatures: {temperatures()}")
+        time.sleep(.025)
+
+
+def reuse_rejection():
+    folder = args.output / "monolith"
+    evidence = report["reuse_rejection"] = {"model": "thermal", "nvml": [], "lead": {}, "follower": {}}
+    samples, lead, follower = evidence["nvml"], evidence["lead"], evidence["follower"]
+    with ExitStack() as stack:
+        app, port, config = launch(folder, stack, initial_device=target_ordinal)
+        evidence["pid"] = app.pid
+        hold = (source_reuse + source_limit + 1) // 2
+        source_ready, source_arm, source_stop = heater(folder, stack, source_ordinal, hold=hold)
+        target_ready, target_arm, target_stop = heater(folder, stack, target_ordinal, preheat=True, preheat_margin=7)
+        stop = threading.Event()
+        sampler = start_worker(sample_reuse_temperatures, samples, stop)
+
+        def execution_rows():
+            return [row for row in audit(config) if row["EventType"] == "inference.execution"]
+
+        try:
+            wait_until(lambda: source_ready.exists() and target_ready.exists() and 0 < temperatures()[1] <= target_limit,
+                args.cooldown_timeout, "the workloads and a cool initial GPU")
+            client = stack.enter_context(closing(HTTPConnection("127.0.0.1", port, timeout=380)))
+            lead_thread = start_worker(request, client, evidence["model"], "Hello. " * 12 + "How are you?", lead)
+            wait_until(lambda: any(row["EventType"] == "inference.policy" for row in audit(config)), 12, "lead admission")
+            source_arm.touch()
+
+            def ready_to_heat():
+                if not lead_thread.is_alive():
+                    raise RuntimeError(f"Lead ended before the thermal trigger: {lead}")
+                recent = [row for row in samples[-120:] if time.time() - row[0] < .8]
+                return len(recent) >= 15 and all(source_reuse < temp <= source_limit for _, temp, _, _ in recent)
+
+            wait_until(ready_to_heat, 110, "the destination in the rejection temperature band")
+            evidence["target_heat_at"] = time.time()
+            target_arm.touch()
+            print(json.dumps({"event": "heating_current_gpu", "nvml": temperatures(), "pid": app.pid}), flush=True)
+            wait_until(lambda: bool(execution_rows()), 145, "the lead terminal audit")
+            source_stop.touch()
+            lead_thread.join(15)
+            assert not lead_thread.is_alive(), "Lead client did not receive the rejection"
+            evidence["lead_audit"] = rejected = execution_rows()[0]
+            evidence["swap_after_rejection"] = swaps(config)
+            rejected_at = datetime.fromisoformat(rejected["Timestamp"]).timestamp()
+            first_hot = next((t for t, _, temp, _ in samples
+                if evidence["target_heat_at"] <= t <= rejected_at and temp > target_limit), None)
+            hot_window = [row for row in samples if first_hot is not None and first_hot <= row[0] <= rejected_at]
+            evidence["rejection_window"] = hot_window
+            record = rejected["Metadata"]
+            rejected_temp = int(record.get("gpu_migration_last_thermal_rejection_temperature_celsius", 0))
+            allocated = int(record.get("kv_cuda_vram_bytes_before_dispose", 0))
+            configured_vram = WEIGHT_BLOCK_BYTES * WEIGHT_VRAM_BLOCKS + KV_PAGE_BYTES * KV_VRAM_BLOCKS
+            evidence["rejection_checks"] = rejection_checks = {
+                "no_eligible_destination": rejected["Description"] == "device_thermal_migration_unavailable" and
+                    lead.get("error", {}).get("code") == "device_thermal_migration_unavailable" and
+                    record.get("cuda_device_ordinal") == str(target_ordinal) and "gpu_migrations" not in record,
+                "rejection_uses_reuse_limit": bool(hot_window) and source_reuse < rejected_temp <= source_limit and
+                    record.get("gpu_migration_last_thermal_rejection_pci") == source and
+                    record.get("gpu_migration_last_thermal_rejection_limit_celsius") == str(source_reuse),
+                "destination_has_sufficient_vram": bool(hot_window) and
+                    all(free is not None and free >= configured_vram for _, _, _, free in hot_window),
+                "rejected_request_releases_kv": allocated > 0 and
+                    record.get("kv_cuda_vram_bytes_released_on_dispose") == str(allocated) and
+                    record.get("kv_cuda_vram_bytes_after_dispose") == "0" and not evidence["swap_after_rejection"],
+            }
+            print(json.dumps({"event": "rejected", "checks": rejection_checks, "temperature": rejected_temp,
+                "kv_freed_bytes": allocated}), flush=True)
+            assert all(rejection_checks.values()), rejection_checks
+
+            def ready_to_recover():
+                source_temp, target_temp = temperatures()
+                return 0 < source_temp <= source_reuse and target_temp > target_limit
+
+            wait_until(ready_to_recover, args.cooldown_timeout, "the destination to cool while the current GPU is hot")
+            evidence["recovery_nvml"] = temperatures()
+            successor = stack.enter_context(closing(HTTPConnection("127.0.0.1", port, timeout=330)))
+            follower_thread = start_worker(request, successor, evidence["model"], "Once", follower)
+            print(json.dumps({"event": "recovery_started", "nvml": evidence["recovery_nvml"], "pid": app.pid}), flush=True)
+
+            def switched_or_finished():
+                if context_devices(app.pid) == [source]:
+                    evidence["return_context_seen"] = True
+                    return True
+                return not follower_thread.is_alive()
+
+            wait_until(switched_or_finished, 65, "the recovery CUDA context")
+            target_stop.touch()
+            follower_thread.join(330)
+            assert not follower_thread.is_alive(), "Recovery request did not complete"
+            wait_until(lambda: len(execution_rows()) >= 2, 5, "the recovery terminal audit")
+            evidence["recovery_audit"] = recovered = execution_rows()[1]
+            record = recovered["Metadata"]
+            evidence["remaining_swap"] = swaps(config)
+            evidence["checks"] = {
+                "same_process_same_model": app.poll() is None and
+                    recovered["Subject"] == rejected["Subject"] == evidence["model"] and
+                    record["request_id"] != rejected["Metadata"]["request_id"],
+                "cooled_destination_accepted": evidence.get("return_context_seen", False) and
+                    record.get("gpu_migration_from_pci") == target and record.get("gpu_migration_to_pci") == source and
+                    record.get("cuda_device_ordinal") == str(source_ordinal) and
+                    accepted_limits(record, target_limit, source_reuse),
+                "follower_finishes_and_releases_kv": recovered["Description"] == "succeeded" and complete(follower) and
+                    follower.get("id") == record.get("completion_id") and
+                    record.get("kv_cuda_vram_bytes_after_dispose") == "0" and not evidence["remaining_swap"],
+            }
+            print(json.dumps({"event": "recovery_completed", "checks": evidence["checks"], "output": follower["pieces"]}), flush=True)
+            assert all(evidence["checks"].values()), evidence["checks"]
+        finally:
+            stop.set()
+            source_stop.touch()
+            target_stop.touch()
+            sampler.join(10)
+            evidence["audit"] = audit(config)
+            (folder / "audit.json").write_text(json.dumps(evidence["audit"], indent=2), encoding="utf-8")
+            save()
+
+
 def isolated():
     with ExitStack() as stack:
         app, port, config = launch(args.output / "isolated", stack, baseline=True)
@@ -436,7 +584,7 @@ def isolated():
         assert complete(outcome), outcome
         return result
 
-try:
+def repeated_cancellation():
     with ExitStack() as stack:
         app, port, config = launch(args.output / "monolith", stack)
         model = "thermal"
@@ -458,18 +606,28 @@ try:
             print(json.dumps({"cycle": n, "checks": evidence["checks"], "lead": metadata(evidence, "canceled"),
                 "follower": evidence["follower"]["pieces"]}), flush=True)
             assert all(evidence["checks"].values()), "Cycle verification failed"
+
+
+try:
+    if args.scenario == "reuse-rejection":
+        reuse_rejection()
+        cases = [report["reuse_rejection"]]
+    else:
+        repeated_cancellation()
+        cases = report["cycles"]
     baseline = report["isolated"] = isolated()
     reference = metadata(baseline, "succeeded")
     assert (reference.get("cuda_device_ordinal") == str(source_ordinal) and "gpu_migrations" not in reference and
         reference.get("completion_id") == baseline["follower"].get("id") and
         "local_prefill_tokens" in reference and "local_forward_layers" in reference), "Invalid isolated reference"
-    for e in report["cycles"]:
+    for e in cases:
         successor = metadata(e, "succeeded")
         e["checks"]["matches_isolated_output"] = all(e["follower"].get(k) == baseline["follower"].get(k)
             for k in ("pieces", "finish")) and all(successor.get(k) == reference.get(k)
             for k in ("local_prefill_tokens", "local_forward_layers"))
-    report["verified"] = len(report["cycles"]) == 2 and len({(e["pid"], e["model"]) for e in report["cycles"]}) == 1 and all(
-        all(e["checks"].values()) for e in report["cycles"])
+    correct_sessions = args.scenario == "reuse-rejection" or (
+        len(cases) == 2 and len({(e["pid"], e["model"]) for e in cases}) == 1)
+    report["verified"] = correct_sessions and all(all(e["checks"].values()) for e in cases)
     assert report["verified"], "Successors did not match the isolated run"
     save()
     print(json.dumps({"verified": report.get("verified"), "reference": baseline["follower"]["pieces"]}), flush=True)

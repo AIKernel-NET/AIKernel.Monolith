@@ -275,6 +275,21 @@ the same model ID and process. Both successors must match an isolated run using
 the same executable and checkpoint. The report directory contains `result.json`,
 inference audits, and the temperature and server logs.
 
+Use the same runner to test rejection and recovery at the lower migration
+target limit. With these settings, device 1 starts the request. The test heats
+device 1 above 77 °C while keeping device 0 in the rejection band above 62 °C
+and at or below 68 °C.
+
+```powershell
+python tests/native-aot-thermal-cancel.py <published-exe> <openllama-gguf> <report-directory> --scenario reuse-rejection --devices 0 1 --device-limits 68 62 77 75
+```
+
+The test checks the NVML temperature used to reject device 0 and verifies
+that the rejected request releases its KV allocations and SSD swap. After
+device 0 cools to 62 °C or below, the same model ID must migrate and finish
+in the same process. Its output, finish reason, and prefill and forward
+counts must match an isolated run on device 0.
+
 ## Retrieval-Augmented Generation
 
 RAG uses registered embedding and chat models. The same Monolith bearer token,

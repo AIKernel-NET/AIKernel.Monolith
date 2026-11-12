@@ -13,7 +13,7 @@ def check(call, *args):
         raise RuntimeError(f"{call.__name__}: {status}")
 
 
-def run_heat(ordinal, pci_bus_id, threshold, seconds, arm_file, ready_file, stop_file, preheat, preheat_celsius):
+def run_heat(ordinal, pci_bus_id, threshold, seconds, arm_file, ready_file, stop_file, preheat, preheat_celsius, hold_celsius=None):
     ptx = b"""
 .version 7.0
 .target sm_75
@@ -119,6 +119,7 @@ next_vec:
             ready_file.touch()
         start = time.monotonic()
         active_at = start if arm_file is None else None
+        last_sample = start - 1
         while time.monotonic() - start < 600:
             if stop_file and stop_file.exists():
                 break
@@ -130,9 +131,24 @@ next_vec:
             check(nv.nvmlDeviceGetTemperature, handle, 0, c.byref(temp))
             elapsed = now - start
             active = active_at is not None
-            print(json.dumps({"s": round(elapsed, 3), "active": active, "temperature": temp.value}), flush=True)
+            if hold_celsius is None or now - last_sample >= .07:
+                print(json.dumps({"s": round(elapsed, 3), "active": active, "temperature": temp.value}), flush=True)
+                last_sample = now
             if temp.value >= 84:
                 break
+            if active and hold_celsius is not None:
+                # Use smaller grids near the hold temperature to avoid abrupt power and temperature changes.
+                if temp.value < hold_celsius - 3:
+                    blocks = 512
+                elif temp.value < hold_celsius - 1:
+                    blocks = 64
+                elif temp.value <= hold_celsius:
+                    blocks = 36
+                else:
+                    blocks = 18
+                check(drv.cuLaunchKernel, fn, blocks, 1, 1, 128, 1, 1, 0, None, params, None)
+                check(drv.cuCtxSynchronize)
+                continue
             if not active and (not preheat or temp.value >= preheat_celsius):
                 time.sleep(0.18)
                 continue
@@ -163,10 +179,14 @@ if __name__ == "__main__":
     p.add_argument("--stop-file", type=Path)
     p.add_argument("--preheat", action="store_true")
     p.add_argument("--preheat-celsius", type=int)
+    p.add_argument("--hold-celsius", type=int)
     a = p.parse_args()
     if not 0 < a.seconds <= 180 or not 3 <= a.threshold <= 82:
         p.error("workload duration or thermal threshold is out of range")
     preheat_celsius = a.threshold - 2 if a.preheat_celsius is None else a.preheat_celsius
     if not 0 <= preheat_celsius < a.threshold:
         p.error("preheat temperature must be below the running threshold")
-    run_heat(a.ordinal, a.pci, a.threshold, a.seconds, a.arm_file, a.ready_file, a.stop_file, a.preheat, preheat_celsius)
+    if a.hold_celsius is not None and (a.preheat or not 0 < a.hold_celsius <= a.threshold):
+        p.error("hold temperature must be at or below the running threshold and cannot be combined with preheating")
+    run_heat(a.ordinal, a.pci, a.threshold, a.seconds, a.arm_file, a.ready_file, a.stop_file,
+        a.preheat, preheat_celsius, a.hold_celsius)
