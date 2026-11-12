@@ -229,6 +229,8 @@ The migration target limit defaults to the running limit and must be between
 is triggered. A candidate is eligible at or below its migration target limit,
 including when a later request returns to a GPU used before. The model's
 batch power limit also applies to devices with temperature overrides.
+The inference audit records the last candidate rejected by the temperature
+check, along with the PCI identifier, NVML temperature, and configured limit.
 
 Run the GPU governance test with the same TinyStories fixture directory
 used by the standalone test.

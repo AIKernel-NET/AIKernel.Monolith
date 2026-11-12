@@ -379,7 +379,14 @@ internal sealed partial class PagedLlamaModel : IDisposable
 
         DeviceHealthSnapshot? MigrationTargetHealth(string targetPci, DeviceHealthLimits limits)
         {
-            var health = CheckHealth(targetPci, limits);
+            var sample = ReadHealth(targetPci);
+            var health = DeviceHealthPolicy.Evaluate(sample, limits, settings.Priority);
+            if (sample.IsSuccess && health.Error?.Code == "device_temperature_exceeded")
+            {
+                audit["gpu_migration_last_thermal_rejection_pci"] = targetPci;
+                audit["gpu_migration_last_thermal_rejection_temperature_celsius"] = sample.Value.TemperatureCelsius.ToString(CultureInfo.InvariantCulture);
+                audit["gpu_migration_last_thermal_rejection_limit_celsius"] = limits.MaximumTemperatureCelsius.ToString(CultureInfo.InvariantCulture);
+            }
             return health.IsSuccess && Admission.Evaluate(request, budget with
             {
                 AvailableVramBytes = (long)Math.Min((ulong)configuredVram, health.Value.VramFreeBytes)
@@ -536,9 +543,11 @@ internal sealed partial class PagedLlamaModel : IDisposable
     }
 
     private Result<DeviceHealthSnapshot> CheckHealth(string? pci, DeviceHealthLimits limits)
-        => DeviceHealthPolicy.Evaluate(telemetry is not null && pci is { } id
-            ? telemetry.Read(id) : Result<DeviceHealthSnapshot>.Fail(HealthUnavailable),
-            limits, settings.Priority);
+        => DeviceHealthPolicy.Evaluate(ReadHealth(pci), limits, settings.Priority);
+
+    private Result<DeviceHealthSnapshot> ReadHealth(string? pci)
+        => telemetry is not null && pci is { } id
+            ? telemetry.Read(id) : Result<DeviceHealthSnapshot>.Fail(HealthUnavailable);
 
     private static void RequireMigration<T>(Result<T> result)
     {
