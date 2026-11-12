@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import runpy
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -82,6 +83,20 @@ class DedicatedVramCounter:
         return {}
 
 
+def process_api():
+    kernel = C.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = (W.DWORD, W.BOOL, W.DWORD)
+    kernel.OpenProcess.restype = W.HANDLE
+    kernel.WaitForSingleObject.argtypes = (W.HANDLE, W.DWORD)
+    kernel.WaitForSingleObject.restype = W.DWORD
+    kernel.CloseHandle.argtypes = (W.HANDLE,)
+    kernel.TerminateProcess.argtypes = (W.HANDLE, W.UINT)
+    kernel.TerminateProcess.restype = W.BOOL
+    kernel.GetExitCodeProcess.argtypes = (W.HANDLE, C.POINTER(W.DWORD))
+    kernel.GetExitCodeProcess.restype = W.BOOL
+    return kernel
+
+
 def assert_probe_exited(log_path, monolith_pid):
     log = log_path.read_text(encoding="utf-8")
     probes = list(re.finditer(r"CUDA topology probe process ([0-9]+) exited with code ([0-9]+)\.", log))
@@ -91,12 +106,7 @@ def assert_probe_exited(log_path, monolith_pid):
     listening = log.index("Now listening on:")
     assert probe_pid != monolith_pid and exit_code == 0 and probe.end() < listening, log
 
-    kernel = C.WinDLL("kernel32", use_last_error=True)
-    kernel.OpenProcess.argtypes = (W.DWORD, W.BOOL, W.DWORD)
-    kernel.OpenProcess.restype = W.HANDLE
-    kernel.WaitForSingleObject.argtypes = (W.HANDLE, W.DWORD)
-    kernel.WaitForSingleObject.restype = W.DWORD
-    kernel.CloseHandle.argtypes = (W.HANDLE,)
+    kernel = process_api()
     with_handle = kernel.OpenProcess(0x00100000, False, probe_pid)  # SYNCHRONIZE
     if with_handle:
         try:
@@ -167,7 +177,111 @@ def measure_queries(counter, pid, query):
     return responses, measurement
 
 
-def test(exe, assets, output):
+def send(port, key, method, path, body=None, sent=None):
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    with closing(HTTPConnection("127.0.0.1", port, timeout=60)) as connection:
+        connection.request(method, path, body, headers)
+        if sent is not None:
+            sent()
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        assert response.status == 200, (response.status, payload)
+        return payload
+
+
+def admission(port, key, name, sent=None):
+    path = "/v1/models/admission?" + urlencode({"model": name})
+    return send(port, key, "GET", path, sent=sent)
+
+
+def wait_for_fault_probe(process, log_path):
+    marker = re.compile(r"CUDA probe fault fixture ready pid=([0-9]+) devices=([0-9]+)")
+    deadline = time.monotonic() + 25
+    while process.poll() is None and time.monotonic() < deadline:
+        log = log_path.read_text(encoding="utf-8", errors="replace")
+        assert "Now listening on:" not in log, log
+        if match := marker.search(log):
+            assert int(match[2]) >= 2, log
+            return int(match[1])
+        time.sleep(0.05)
+    raise RuntimeError(log_path.read_text(encoding="utf-8", errors="replace"))
+
+
+def verify_probe_fault(process, log_path, helpers, key, fault):
+    probe_pid = wait_for_fault_probe(process, log_path)
+    assert probe_pid != process.pid
+    kernel = process_api()
+    # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE
+    handle = kernel.OpenProcess(0x00101001, False, probe_pid)
+    if not handle:
+        raise C.WinError(C.get_last_error())
+    try:
+        with closing(DedicatedVramCounter()) as counter:
+            deadline = time.monotonic() + 5
+            while True:
+                before = counter.sample(probe_pid)
+                if sum(value > 0 for value in before.values()) >= 2:
+                    break
+                assert time.monotonic() < deadline, before
+                time.sleep(0.05)
+            assert kernel.WaitForSingleObject(handle, 0) == 0x102, "CUDA probe exited before fault injection"
+            assert "Now listening on:" not in log_path.read_text(encoding="utf-8")
+            if fault == "abnormal-exit" and not kernel.TerminateProcess(handle, 73):
+                raise C.WinError(C.get_last_error())
+
+            port = helpers["wait_for_port"](process, log_path)
+            log = log_path.read_text(encoding="utf-8")
+            expected = (f"CUDA topology probe process {probe_pid} exited with code 73."
+                        if fault == "abnormal-exit" else "CUDA device enumeration timed out.")
+            assert log.index(expected) < log.index("Now listening on:"), log
+            assert kernel.WaitForSingleObject(handle, 0) == 0, f"CUDA probe {probe_pid} is still running"
+            exit_code = W.DWORD()
+            if not kernel.GetExitCodeProcess(handle, C.byref(exit_code)):
+                raise C.WinError(C.get_last_error())
+            if fault == "abnormal-exit":
+                assert exit_code.value == 73, exit_code.value
+            else:
+                assert exit_code.value != 0, exit_code.value
+
+            deadline = time.monotonic() + 3
+            while probe_after := sum(counter.sample(probe_pid).values()):
+                assert time.monotonic() < deadline, probe_after
+                time.sleep(0.05)
+
+            def query_models(first_sent):
+                first = admission(port, key, "first", sent=first_sent)
+                second = admission(port, key, "second")
+                for _ in range(5):
+                    admission(port, key, "first")
+                    admission(port, key, "second")
+                    time.sleep(0.05)
+                return first, second
+
+            statuses, measurement = measure_queries(counter, process.pid, query_models)
+            for ordinal, status in enumerate(statuses):
+                assert not status["admissible"] and status["reason"] == "cuda_device_unavailable", status
+                assert status["backend"] == "unknown" and status["admission_device"] is None, status
+                assert [gpu["device"] for gpu in status["devices"]] == [ordinal], status
+                for gpu in status["devices"]:
+                    assert not gpu["migration_target_eligible"] and gpu["pci_bus_id"] is None, gpu
+                    assert gpu["temperature_celsius"] is None, gpu
+            probe_after_queries = sum(counter.sample(probe_pid).values())
+            assert probe_after_queries == 0, probe_after_queries
+            return {
+                "fault": fault, "monolith_pid": process.pid, "probe_pid": probe_pid,
+                "probe_exit_code": exit_code.value, "probe_exited_before_listen": True,
+                "probe_vram_before_fault_by_adapter": before,
+                "probe_vram_after_exit_bytes": probe_after, "probe_vram_after_queries_bytes": probe_after_queries,
+                "dedicated_vram": measurement, "model_statuses": statuses,
+            }
+    finally:
+        if kernel.WaitForSingleObject(handle, 0) == 0x102:
+            kernel.TerminateProcess(handle, 1)
+            kernel.WaitForSingleObject(handle, 5000)
+        kernel.CloseHandle(handle)
+
+
+def test(exe, assets, output, fault_library=None, fault=None):
     output.mkdir(parents=True, exist_ok=True)
     standalone = runpy.run_path(str(Path(__file__).with_name("native-aot-standalone.py")))
     helpers = standalone["helpers"]
@@ -202,38 +316,42 @@ def test(exe, assets, output):
         env = dict(os.environ, AIKERNEL_API_KEY=key, AIKERNEL_API_REQUEST_LIMIT="1000",
                    Logging__LogLevel__Microsoft__Hosting__Lifetime="Information")
         env["Logging__LogLevel__AIKernel.Monolith.Models.CudaTopology"] = "Debug"
+        executable = exe
+        if fault is not None:
+            executable = work / exe.name
+            shutil.copyfile(exe, executable)
+            assert helpers["native_image"](executable) == native_sha256
+            shutil.copyfile(fault_library, work / "aikernel_cuda_driver.dll")
+            real_driver = work / "aikernel_cuda_driver.real.dll"
+            shutil.copyfile(exe.with_name("aikernel_cuda_driver.dll"), real_driver)
+            env["AIKERNEL_TEST_REAL_CUDA_LIBRARY"] = str(real_driver)
+
         log_path = output / "monolith.log"
         with log_path.open("wb") as log:
             process = subprocess.Popen(
-                [str(exe), "--urls=http://127.0.0.1:0",
+                [str(executable), "--urls=http://127.0.0.1:0",
                  *[f"--{name}-root={mount}" for name, mount in mounts.items()]],
                 cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
             try:
+                if fault is not None:
+                    report = verify_probe_fault(process, log_path, helpers, key, fault)
+                    assert not (mounts["config"] / "inference-audit.jsonl").exists()
+                    assert not (mounts["config"] / "model-swap").exists()
+                    report["native_sha256"] = native_sha256
+                    write_report(output, report)
+                    return
+
                 port = helpers["wait_for_port"](process, log_path)
                 probe_pid = assert_probe_exited(log_path, process.pid)
-                headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-
-                def send(method, path, body=None, sent=None):
-                    with closing(HTTPConnection("127.0.0.1", port, timeout=60)) as connection:
-                        connection.request(method, path, body, headers)
-                        if sent is not None:
-                            sent()
-                        response = connection.getresponse()
-                        payload = json.loads(response.read())
-                        assert response.status == 200, (response.status, payload)
-                        return payload
-
-                def admission(name, sent=None):
-                    return send("GET", "/v1/models/admission?" + urlencode({"model": name}), sent=sent)
 
                 def query_models(first_sent):
-                    first = admission("first", sent=first_sent)
-                    second = admission("second")
-                    hot = admission("thermal")
+                    first = admission(port, key, "first", sent=first_sent)
+                    second = admission(port, key, "second")
+                    hot = admission(port, key, "thermal")
                     for _ in range(10):
-                        admission("first")
-                        admission("second")
-                        admission("thermal")
+                        admission(port, key, "first")
+                        admission(port, key, "second")
+                        admission(port, key, "thermal")
                         time.sleep(0.05)
                     return first, second, hot
 
@@ -250,7 +368,7 @@ def test(exe, assets, output):
 
                     # Prove the counter detects real allocations in the same PID on both adapters.
                     for name in ("first", "second"):
-                        completion = send("POST", "/v1/completions", json.dumps(
+                        completion = send(port, key, "POST", "/v1/completions", json.dumps(
                             {"model": name, "prompt": standalone["PROMPT"]}))
                         assert completion["choices"][0]["text"] == standalone["EXPECTED"], completion
                     for _ in range(30):
@@ -267,13 +385,17 @@ def test(exe, assets, output):
                     "admitted_models": [first["model"], second["model"]], "thermal_denial": hot["reason"],
                     "dedicated_vram_after_inference_by_adapter": control,
                 }
-                encoded = json.dumps(report, indent=2)
-                (output / "admission-vram-result.json").write_text(encoded, encoding="utf-8")
-                print(encoded)
+                write_report(output, report)
             finally:
                 if process.poll() is None:
                     process.terminate()
                     process.wait(timeout=15)
+
+
+def write_report(output, report):
+    encoded = json.dumps(report, indent=2)
+    (output / "admission-vram-result.json").write_text(encoded, encoding="utf-8")
+    print(encoded, flush=True)
 
 
 if __name__ == "__main__":
@@ -281,7 +403,12 @@ if __name__ == "__main__":
     parser.add_argument("exe", type=Path)
     parser.add_argument("assets", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--probe-fault-library", type=Path, help="Run abnormal-exit and timeout cases with this DLL")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("Windows GPU Process Memory counters are required")
     test(args.exe.resolve(), args.assets.resolve(), args.output.resolve())
+    if args.probe_fault_library:
+        for fault in ("abnormal-exit", "timeout"):
+            test(args.exe.resolve(), args.assets.resolve(), args.output.resolve() / fault,
+                 fault_library=args.probe_fault_library.resolve(), fault=fault)

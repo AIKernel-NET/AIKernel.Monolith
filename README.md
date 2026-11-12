@@ -278,6 +278,17 @@ both adapters to verify that the counter detects allocations.
 python tests/native-aot-admission-vram.py <published-exe> <model-assets-directory> <report-directory>
 ```
 
+To also exercise an abnormal probe exit and a probe timeout, build the fixture
+from an x64 Native Tools Command Prompt and pass the DLL to the regression.
+The fixture uses the real CUDA driver and waits after writing the PCI mapping.
+The test checks that Monolith starts with GPU admission unavailable and both
+the probe process and its VRAM are released.
+
+```bat
+cl /nologo /LD /MT tests/fixtures/cuda-probe-fault.c /link /OUT:cuda-probe-fault.dll
+python tests/native-aot-admission-vram.py <published-exe> <model-assets-directory> <report-directory> --probe-fault-library cuda-probe-fault.dll
+```
+
 The Native AOT console project in `tests/AIKernel.Monolith.ThermalTests`
 uses two physical CUDA devices and live NVML data. It injects over-limit
 temperature samples during generation to check migration and refusal
