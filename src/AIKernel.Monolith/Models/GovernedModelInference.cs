@@ -218,9 +218,11 @@ internal sealed class GovernedModelInference(
                 {
                     "unsupported_model_format" => InferenceErrors.UnsupportedLocalModel,
                     "local_memory_exhausted" => InferenceErrors.LocalMemoryExhausted,
+                    "device_temperature_exceeded" or "device_thermal_migration_unavailable"
+                        => new InferenceError(503, reason, "The configured local inference route is unavailable.",
+                            RetryAfterSeconds: InferenceErrors.ThermalRetryAfterSeconds),
                     "resource_budget_exceeded" or "resource_pcie_budget_exceeded" or "device_queue_full" or
-                    "device_temperature_exceeded" or "device_power_throttled" or "device_telemetry_unavailable" or
-                    "device_thermal_migration_unavailable" or "device_thermal_migration_failed"
+                    "device_power_throttled" or "device_telemetry_unavailable" or "device_thermal_migration_failed"
                         => new InferenceError(503, reason, "The configured local inference route is unavailable."),
                     _ => InferenceErrors.ProviderFailed
                 })
@@ -245,10 +247,13 @@ internal sealed class GovernedModelInference(
 }
 
 internal sealed record InferenceOutcome<T>(T? Value = null, InferenceError? Error = null) where T : class;
-internal sealed record InferenceError(int Status, string Code, string Message);
+internal sealed record InferenceError(int Status, string Code, string Message, int? RetryAfterSeconds = null);
 
 internal static class InferenceErrors
 {
+    // Advise clients when to check again without estimating the GPU's cooling time.
+    internal const int ThermalRetryAfterSeconds = 5;
+
     internal static readonly InferenceError InvalidRequest =
         new(400, "invalid_request", "A model ID and valid text messages are required.");
     internal static readonly InferenceError ContextLengthExceeded =

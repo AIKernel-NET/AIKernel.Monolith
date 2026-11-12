@@ -214,6 +214,13 @@ the health and resource checks under its lease. A request visits each
 physical GPU at most once and returns `device_thermal_migration_unavailable`
 if no alternative can run it. Batch power limits still reject work.
 
+For `device_temperature_exceeded` and `device_thermal_migration_unavailable`,
+the API returns HTTP 503 with
+`Retry-After: 5` and `error.retry_after_seconds: 5` in the JSON body. If
+streaming has already started, the SSE error event carries the same JSON
+field. The value is a polling interval. GPU eligibility is checked again
+when the client retries.
+
 This `local` registration fragment configures separate limits for two GPUs.
 
 ```json

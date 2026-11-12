@@ -57,14 +57,22 @@ def test(exe, assets, output, expect_nvml):
                 port = helpers["wait_for_port"](process, log_path)
                 headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
-                def complete(name, status=200):
+                def complete(name, status=200, *, stream=False, retry_after=None):
                     with closing(HTTPConnection("127.0.0.1", port, timeout=150)) as connection:
                         connection.request("POST", "/v1/completions", json.dumps(
-                            {"model": name, "prompt": prompt}), headers)
+                            {"model": name, "prompt": prompt, "stream": stream}), headers)
                         result = connection.getresponse()
                         body = result.read()
                         assert result.status == status, (name, result.status, body)
-                        return json.loads(body)
+                        assert result.getheader("Retry-After") == (
+                            str(retry_after) if retry_after is not None else None)
+                        payload = json.loads(body)
+                        if status == 503:
+                            if retry_after is None:
+                                assert "retry_after_seconds" not in payload["error"]
+                            else:
+                                assert payload["error"]["retry_after_seconds"] == retry_after
+                        return payload
 
                 def metadata(completion_id):
                     return next(entry["Metadata"] for entry in helpers["audit_entries"](audit_path)
@@ -80,7 +88,9 @@ def test(exe, assets, output, expect_nvml):
                 if expect_nvml:
                     assert health["backend"] == "cuda" and int(health["device_temperature_celsius"]) > 1
                 if health["backend"] == "cuda":
-                    assert complete("thermal", 503)["error"]["code"] == "device_temperature_exceeded"
+                    for stream in (False, True):
+                        rejected = complete("thermal", 503, stream=stream, retry_after=5)
+                        assert rejected["error"]["code"] == "device_temperature_exceeded"
 
                 with ThreadPoolExecutor(max_workers=1) as pool, closing(
                         HTTPConnection("127.0.0.1", port, timeout=150)) as connection:

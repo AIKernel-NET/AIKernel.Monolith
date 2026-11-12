@@ -116,7 +116,9 @@ internal sealed record OpenAIErrorResponse(
 
 internal sealed record OpenAIError(
     [property: JsonPropertyName("message")] string Message,
-    [property: JsonPropertyName("code")] string Code);
+    [property: JsonPropertyName("code")] string Code,
+    [property: JsonPropertyName("retry_after_seconds")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? RetryAfterSeconds = null);
 
 internal sealed record EmbeddingApiRequest(
     [property: JsonPropertyName("model")] string Model,

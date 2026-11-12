@@ -100,7 +100,5 @@ internal static class RagEndpointExtensions
             ? ErrorResponse(error)
             : Results.Json(outcome.Value!, typeInfo);
 
-    private static IResult ErrorResponse(InferenceError error)
-        => Results.Json(new OpenAIErrorResponse(new OpenAIError(error.Message, error.Code)),
-            InferenceJsonContext.Default.OpenAIErrorResponse, statusCode: error.Status);
+    private static IResult ErrorResponse(InferenceError error) => new InferenceErrorResult(error);
 }

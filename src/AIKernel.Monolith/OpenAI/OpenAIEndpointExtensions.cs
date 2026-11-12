@@ -108,9 +108,5 @@ public static class OpenAIEndpointExtensions
         return Results.Empty;
     }
 
-    private static IResult ErrorResponse(InferenceError error)
-        => Results.Json(
-            new OpenAIErrorResponse(new OpenAIError(error.Message, error.Code)),
-            InferenceJsonContext.Default.OpenAIErrorResponse,
-            statusCode: error.Status);
+    private static IResult ErrorResponse(InferenceError error) => new InferenceErrorResult(error);
 }

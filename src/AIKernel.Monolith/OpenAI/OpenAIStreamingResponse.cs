@@ -21,7 +21,7 @@ internal sealed class OpenAIStreamingResponse(HttpContext context, string model,
     }
 
     internal Task WriteErrorAsync(InferenceError error) =>
-        WriteEventAsync(JsonSerializer.Serialize(new OpenAIErrorResponse(new OpenAIError(error.Message, error.Code)),
+        WriteEventAsync(JsonSerializer.Serialize(InferenceErrorResult.CreatePayload(error),
             InferenceJsonContext.Default.OpenAIErrorResponse));
 
     private Task WriteCompletionAsync(string? content, string? finishReason)
