@@ -24,6 +24,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
     private readonly NvmlDeviceTelemetry? ownedTelemetry;
     private string? pciBusId;
     private int deviceOrdinal;
+    private DeviceHealthLimits activeHealthLimits;
     private bool thermalPlacementUnavailable;
     private readonly bool telemetryFallback;
     private readonly long parameters;
@@ -46,6 +47,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
         this.settings = settings;
         this.logger = logger;
         deviceOrdinal = settings.Device;
+        activeHealthLimits = settings.GetHealthLimits(deviceOrdinal);
         var extension = Path.GetExtension(settings.Checkpoint);
         var isMapped = extension.Equals(".gguf", StringComparison.OrdinalIgnoreCase) ||
             extension.Equals(".safetensors", StringComparison.OrdinalIgnoreCase);
@@ -72,7 +74,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
             cuda = CudaVirtualMemoryDevice.TryCreate(settings.Device, out cudaStatus);
             try
             {
-                if (cuda is not null && settings.HealthLimits != default)
+                if (cuda is not null && activeHealthLimits != default)
                 {
                     ownedTelemetry = healthTelemetry is null ? NvmlDeviceTelemetry.Open().Value : null;
                     telemetry = healthTelemetry ?? ownedTelemetry;
@@ -171,9 +173,9 @@ internal sealed partial class PagedLlamaModel : IDisposable
                 settings.KvRamBlocks * (long)kvBlockBytes, configuredVram,
             settings.MaxPcieSwapBytes, useGpu, weightVram, kvVram);
 
-        if (useGpu && settings.HealthLimits != default)
+        if (useGpu && activeHealthLimits != default)
         {
-            var currentHealth = CheckHealth();
+            var currentHealth = CheckHealth(pciBusId, activeHealthLimits);
             DeviceHealthSnapshot health;
             if (thermalPlacementUnavailable && currentHealth.Error?.Code == "device_temperature_exceeded"
                 && schedulerForDevice is not null)
@@ -224,8 +226,8 @@ internal sealed partial class PagedLlamaModel : IDisposable
         {
             forwardLayers++;
             if (execution.Lease is { } lease) Require(lease.Checkpoint());
-            if (cuda is null || settings.HealthLimits == default) return compute;
-            var health = CheckHealth();
+            if (cuda is null || activeHealthLimits == default) return compute;
+            var health = CheckHealth(pciBusId, activeHealthLimits);
             if (health.Error?.Code == "device_temperature_exceeded" && schedulerForDevice is not null)
                 Migrate(position, layer);
             else
@@ -237,6 +239,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
         {
             var previous = cuda!;
             var previousPci = pciBusId!;
+            var sourceTemperatureLimit = activeHealthLimits.MaximumTemperatureCelsius;
             visitedDevices ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             visitedDevices.Add(previousPci);
             visitedOrdinals ??= [];
@@ -249,6 +252,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
                 token.ThrowIfCancellationRequested();
                 var ordinal = allowed is null ? index : allowed[index];
                 if (visitedOrdinals.Contains(ordinal)) continue;
+                var targetLimits = settings.GetHealthLimits(ordinal, migrationTarget: true);
                 var candidate = CudaVirtualMemoryDevice.TryCreate(ordinal, out _);
                 if (candidate is null) continue;
 
@@ -261,7 +265,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
                 try
                 {
                     targetPci = candidate.GetPciBusId();
-                    if (targetPci is null || visitedDevices.Contains(targetPci) || MigrationTargetHealth(targetPci) is null)
+                    if (targetPci is null || visitedDevices.Contains(targetPci) || MigrationTargetHealth(targetPci, targetLimits) is null)
                         continue;
 
                     if (!prepared)
@@ -288,7 +292,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
                         continue;
                     }
                     targetLease = entered.Value!;
-                    if (MigrationTargetHealth(targetPci) is not { } targetHealth) continue;
+                    if (MigrationTargetHealth(targetPci, targetLimits) is not { } targetHealth) continue;
 
                     stage = "target_bind";
                     token.ThrowIfCancellationRequested();
@@ -312,6 +316,7 @@ internal sealed partial class PagedLlamaModel : IDisposable
                     kvAllocations = targetKv;
                     pciBusId = targetPci;
                     deviceOrdinal = ordinal;
+                    activeHealthLimits = settings.GetHealthLimits(ordinal);
                     compute = targetCompute;
                     weights.SetCompute(targetCompute);
                     cache?.SetCompute(targetCompute);
@@ -324,6 +329,9 @@ internal sealed partial class PagedLlamaModel : IDisposable
                     audit["gpu_migrations"] = migrations.ToString(System.Globalization.CultureInfo.InvariantCulture);
                     audit["gpu_migration_from_pci"] = previousPci;
                     audit["gpu_migration_to_pci"] = targetPci;
+                    audit["gpu_migration_source_temperature_limit_celsius"] = sourceTemperatureLimit.ToString(CultureInfo.InvariantCulture);
+                    audit["gpu_migration_target_temperature_limit_celsius"] = targetLimits.MaximumTemperatureCelsius.ToString(CultureInfo.InvariantCulture);
+                    audit["gpu_migration_target_temperature_celsius"] = targetHealth.TemperatureCelsius.ToString(CultureInfo.InvariantCulture);
                     audit["gpu_migration_position"] = position.ToString(System.Globalization.CultureInfo.InvariantCulture);
                     audit["gpu_migration_phase"] = layer.HasValue ? "layer" : "admission";
                     if (layer is { } completedLayer)
@@ -369,9 +377,9 @@ internal sealed partial class PagedLlamaModel : IDisposable
             RequireMigration(result);
         }
 
-        DeviceHealthSnapshot? MigrationTargetHealth(string targetPci)
+        DeviceHealthSnapshot? MigrationTargetHealth(string targetPci, DeviceHealthLimits limits)
         {
-            var health = CheckHealth(targetPci);
+            var health = CheckHealth(targetPci, limits);
             return health.IsSuccess && Admission.Evaluate(request, budget with
             {
                 AvailableVramBytes = (long)Math.Min((ulong)configuredVram, health.Value.VramFreeBytes)
@@ -527,10 +535,10 @@ internal sealed partial class PagedLlamaModel : IDisposable
             throw new InvalidDataException("The snapshot model or prompt does not match the request.");
     }
 
-    private Result<DeviceHealthSnapshot> CheckHealth(string? targetPci = null)
-        => DeviceHealthPolicy.Evaluate(telemetry is not null && (targetPci ?? pciBusId) is { } id
+    private Result<DeviceHealthSnapshot> CheckHealth(string? pci, DeviceHealthLimits limits)
+        => DeviceHealthPolicy.Evaluate(telemetry is not null && pci is { } id
             ? telemetry.Read(id) : Result<DeviceHealthSnapshot>.Fail(HealthUnavailable),
-            settings.HealthLimits, settings.Priority);
+            limits, settings.Priority);
 
     private static void RequireMigration<T>(Result<T> result)
     {

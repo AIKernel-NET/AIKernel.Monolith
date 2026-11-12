@@ -82,7 +82,18 @@ internal sealed record PagedLlamaSettings(string Checkpoint, string? Tokenizer, 
     int BlockSize, int RamBlocks, int VramBlocks, int Device, int ContextTokens, int MaxNewTokens,
     int KvRamBlocks, int KvVramBlocks, float Temperature, float TopP, InferencePriority Priority,
     long MaxPcieSwapBytes, DeviceHealthLimits HealthLimits, SwapEncryptionPolicy SwapPolicy,
-    int[]? ThermalMigrationDevices = null);
+    int[]? ThermalMigrationDevices = null, IReadOnlyDictionary<int, DeviceThermalLimits>? ThermalDeviceLimits = null)
+{
+    internal DeviceHealthLimits GetHealthLimits(int device, bool migrationTarget = false)
+        => ThermalDeviceLimits?.TryGetValue(device, out var limits) == true
+            ? HealthLimits with
+            {
+                MaximumTemperatureCelsius = migrationTarget ? limits.MigrationTargetTemperatureCelsius : limits.TemperatureCelsius
+            }
+            : HealthLimits;
+}
+
+internal readonly record struct DeviceThermalLimits(uint TemperatureCelsius, uint MigrationTargetTemperatureCelsius);
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 internal sealed record PagedLlamaRegistration([property: JsonPropertyName("checkpoint")] string? Checkpoint,
@@ -104,4 +115,11 @@ internal sealed record PagedLlamaRegistration([property: JsonPropertyName("check
     [property: JsonPropertyName("batchPowerLimitPercent")] uint? BatchPowerLimitPercent,
     [property: JsonPropertyName("encryptSwap")] bool? EncryptSwap,
     [property: JsonPropertyName("zeroWipe")] bool? ZeroWipe,
-    [property: JsonPropertyName("thermalMigrationDevices")] int[]? ThermalMigrationDevices);
+    [property: JsonPropertyName("thermalMigrationDevices")] int[]? ThermalMigrationDevices,
+    [property: JsonPropertyName("thermalDeviceLimits")] ThermalDeviceLimitRegistration?[]? ThermalDeviceLimits);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+internal sealed record ThermalDeviceLimitRegistration(
+    [property: JsonPropertyName("device")] int? Device,
+    [property: JsonPropertyName("maxTemperatureCelsius")] uint? MaxTemperatureCelsius,
+    [property: JsonPropertyName("maxMigrationTargetTemperatureCelsius")] uint? MaxMigrationTargetTemperatureCelsius);

@@ -193,6 +193,7 @@ A registered local model can set these optional policy fields.
 | `maxPcieSwapBytes` | Maximum estimated PCIe transfer bytes for one request |
 | `maxTemperatureCelsius` | Maximum GPU temperature, with zero disabling the limit |
 | `thermalMigrationDevices` | Ordered alternative CUDA ordinals. Omit to consider every visible CUDA device, or use `[]` to disallow migration. |
+| `thermalDeviceLimits` | Per-device temperature limits keyed by CUDA ordinal. Devices without an entry use the model's `maxTemperatureCelsius`. |
 | `batchPowerLimitPercent` | Batch throttle threshold as a percentage of the NVML power limit |
 | `encryptSwap` | Use authenticated encryption for SSD swap |
 | `zeroWipe` | Clear released RAM, device blocks, and logical swap ranges |
@@ -212,6 +213,22 @@ cache and activations on an eligible CUDA device. The destination must pass
 the health and resource checks under its lease. A request visits each
 physical GPU at most once and returns `device_thermal_migration_unavailable`
 if no alternative can run it. Batch power limits still reject work.
+
+This `local` registration fragment configures separate limits for two GPUs.
+
+```json
+"thermalDeviceLimits": [
+  { "device": 0, "maxTemperatureCelsius": 68, "maxMigrationTargetTemperatureCelsius": 62 },
+  { "device": 1, "maxTemperatureCelsius": 77, "maxMigrationTargetTemperatureCelsius": 75 }
+]
+```
+
+Each entry requires a unique CUDA ordinal and a running limit from 1 to 120 °C.
+The migration target limit defaults to the running limit and must be between
+1 °C and that limit. A running GPU can reach its running limit before migration
+is triggered. A candidate is eligible at or below its migration target limit,
+including when a later request returns to a GPU used before. The model's
+batch power limit also applies to devices with temperature overrides.
 
 Run the GPU governance test with the same TinyStories fixture directory
 used by the standalone test.
@@ -237,11 +254,16 @@ or empty report directory on the SSD used for the swap files.
 python tests/native-aot-thermal-cancel.py <published-exe> <openllama-gguf> <report-directory> --devices 0 1 --limit 79 --return-margin 0
 ```
 
+Use `--device-limits 68 62 77 75` to exercise the example above. The four
+values are the source running and migration target limits followed by the
+target running and migration target limits. The test checks the limits and
+accepted target temperatures recorded in the audit in both directions.
+
 The test uses a bounded CUDA workload to reach the threshold and waits for the
 source GPU to cool before heating the target for the return migration. Set the
 threshold so that both GPUs can cross it under load and cool back to it between
 requests. Use `--cooldown-timeout` to allow a longer cooldown and
-`--return-margin` to set how far below the threshold the source must cool
+`--return-margin` to set how far below its migration target limit the source must cool
 before the test starts heating the target. Each cycle queues a successor,
 disconnects the active request after SSD KV reads on the target and before the
 first token, and checks that CUDA

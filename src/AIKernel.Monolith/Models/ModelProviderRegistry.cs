@@ -159,13 +159,30 @@ public sealed class ModelProviderRegistry
             throw new InvalidDataException($"Invalid paged Llama model registration in '{path}'.");
         }
 
+        Dictionary<int, DeviceThermalLimits>? thermalLimits = null;
+        if (config.ThermalDeviceLimits is { Length: > 0 } entries)
+        {
+            thermalLimits = new(entries.Length);
+            foreach (var entry in entries)
+            {
+                if (entry is null || entry.Device is not int ordinal || ordinal < 0 ||
+                    entry.MaxTemperatureCelsius is not uint running || running is 0 or > 120)
+                    throw new InvalidDataException($"Invalid thermalDeviceLimits entry in '{path}'.");
+
+                var target = entry.MaxMigrationTargetTemperatureCelsius ?? running;
+                if (target == 0 || target > running || !thermalLimits.TryAdd(ordinal, new(running, target)))
+                    throw new InvalidDataException($"Invalid or duplicate thermalDeviceLimits entry for device {ordinal} in '{path}'.");
+            }
+        }
+
         var local = new PagedLlamaSettings(
             ResolveAsset(mounts.ModelRoot, config.Checkpoint, path),
             config.Tokenizer is null ? null : ResolveAsset(mounts.ModelRoot, config.Tokenizer, path),
             config.Config is null ? null : ResolveAsset(mounts.ModelRoot, config.Config, path),
             Path.Combine(mounts.ConfigRoot, "model-swap"),
             blockSize, ramBlocks, vramBlocks, device, context, maxNew, kvRam, kvVram, temperature, topP,
-            priority.Value, maxPcie, new(maxTemperature, batchPower), new(config.EncryptSwap ?? false, config.ZeroWipe ?? false), config.ThermalMigrationDevices);
+            priority.Value, maxPcie, new(maxTemperature, batchPower), new(config.EncryptSwap ?? false, config.ZeroWipe ?? false),
+            config.ThermalMigrationDevices, thermalLimits);
         return new RegisteredModel(new ModelMetadata(registration.Id, PagedLlamaProviderId, "chat"),
             null, null, ReadPolicy(registration.Policy), local);
     }

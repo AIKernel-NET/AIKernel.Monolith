@@ -23,6 +23,9 @@ parser.add_argument("checkpoint", type=Path, help="OpenLLaMA 3B v2 Q4_0 GGUF wit
 parser.add_argument("output", type=Path, help="new report directory")
 parser.add_argument("--devices", type=int, nargs=2, metavar=("SOURCE", "TARGET"), default=(0, 1))
 parser.add_argument("--limit", type=int, default=78, help="real NVML temperature threshold in Celsius")
+parser.add_argument("--device-limits", type=int, nargs=4,
+    metavar=("SOURCE_RUN", "SOURCE_REUSE", "TARGET_RUN", "TARGET_REUSE"),
+    help="per-device running and migration target limits in Celsius, in --devices order")
 parser.add_argument("--arm-after", type=float, default=22, help="seconds to wait for a natural source crossing")
 parser.add_argument("--cooldown-timeout", type=float, default=180, help="seconds to wait for cool GPUs before admission")
 parser.add_argument("--return-margin", type=int, default=1, help="degrees below the threshold before heating the target")
@@ -32,10 +35,16 @@ if sys.platform != "win32":
 source_ordinal, target_ordinal = args.devices
 if min(args.devices) < 0 or source_ordinal == target_ordinal:
     parser.error("provide two distinct nonnegative CUDA ordinals")
-if not 3 <= args.limit <= 82 or not 0 <= args.arm_after <= 90:
+source_limit, source_reuse, target_limit, target_reuse = args.device_limits or (args.limit,) * 4
+if not (1 <= source_reuse <= source_limit <= 82 and 1 <= target_reuse <= target_limit <= 82 and
+        min(source_limit, target_limit) >= 3 and 0 <= args.arm_after <= 90):
     parser.error("limit must be 3..82 °C and arm-after must be 0..90 seconds")
-if not 1 <= args.cooldown_timeout <= 300 or not 0 <= args.return_margin < args.limit:
+if not 1 <= args.cooldown_timeout <= 300 or not 0 <= args.return_margin < source_reuse:
     parser.error("cooldown-timeout must be 1..300 seconds and return-margin must be below the limit")
+thermal_limits = [
+    {"device": source_ordinal, "maxTemperatureCelsius": source_limit, "maxMigrationTargetTemperatureCelsius": source_reuse},
+    {"device": target_ordinal, "maxTemperatureCelsius": target_limit, "maxMigrationTargetTemperatureCelsius": target_reuse},
+]
 exe = args.exe.resolve(strict=True)
 checkpoint = args.checkpoint.resolve(strict=True)
 args.output = args.output.resolve()
@@ -95,7 +104,9 @@ def fingerprint(path):
 report = {"binary_sha256": helpers["native_image"](exe), "bridge_sha256": fingerprint(bridgedll),
     "checkpoint_sha256": fingerprint(checkpoint),
     "gpus": [{"ordinal": ordinal, "pci": p, "name": n} for ordinal, (_, p, n) in zip(args.devices, devices)],
-    "threshold": args.limit, "return_margin": args.return_margin, "cycles": []}
+    "thermal_limits": thermal_limits, "return_margin": args.return_margin, "cycles": []}
+if not args.device_limits:
+    report["threshold"] = args.limit
 args.output.mkdir(parents=True, exist_ok=True)
 def save():
     (args.output / "result.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -157,8 +168,12 @@ def launch(folder, stack, baseline=False):
         shutil.copyfile(checkpoint, model_path)
     local = {"checkpoint": checkpoint.name, "device": source_ordinal, "blockSize": 33554432,
         "ramBlocks": 8, "vramBlocks": 8, "kvRamBlocks": 2, "kvVramBlocks": 26, "contextTokens": 64,
-        "maxNewTokens": 3, "maxTemperatureCelsius": 100 if baseline else args.limit,
+        "maxNewTokens": 3,
         "encryptSwap": True, "zeroWipe": True, "thermalMigrationDevices": list(args.devices)}
+    if args.device_limits and not baseline:
+        local["thermalDeviceLimits"] = thermal_limits
+    else:
+        local["maxTemperatureCelsius"] = 100 if baseline else args.limit
     entries = [{"id": "thermal", "provider": "providers.paged-llama",
         "policy": {"logos": "approve", "ethos": "approve", "pathos": "approve"}, "local": local}]
     (paths["model"] / "models.json").write_text(json.dumps(entries), encoding="utf-8")
@@ -193,13 +208,16 @@ def swaps(config):
 
 def heater(folder, stack, ordinal, preheat=False):
     prefix, pci = ("source", source) if ordinal == source_ordinal else ("target", target)
+    limit = source_limit if ordinal == source_ordinal else target_limit
     ready, arm, stop = [(folder / (prefix + "-" + name)).resolve() for name in ("ready", "arm", "stop")]
     log = stack.enter_context((folder / (prefix + "-heat.jsonl")).open("wb"))
     command = [sys.executable, "-u", str(root / "thermal_cuda_load.py"),
-        "--ordinal", str(ordinal), "--pci", pci, "--threshold", str(args.limit), "--seconds", "150",
+        "--ordinal", str(ordinal), "--pci", pci, "--threshold", str(limit), "--seconds", "150",
         "--ready-file", str(ready), "--arm-file", str(arm), "--stop-file", str(stop)]
     if preheat:
         command.append("--preheat")
+        if args.device_limits:
+            command.extend(["--preheat-celsius", str(min(target_reuse - 1, target_limit - 2))])
     process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
     stack.callback(stop_process, process)
     return ready, arm, stop
@@ -273,7 +291,7 @@ def cycle(app, port, config, n, model):
                             except OSError as ex:
                                 evidence["abort_error"] = str(ex)
                 if reverse and "abort" in evidence and not target_arm.exists() and not target_stop.exists():
-                    if not set(evidence["abort"]["swap"]).intersection(swap) and 0 < temps[0] <= args.limit - args.return_margin:
+                    if not set(evidence["abort"]["swap"]).intersection(swap) and 0 < temps[0] <= source_reuse - args.return_margin:
                         target_arm.touch()
                         evidence["target_heater_armed_at"] = now()
                         print(json.dumps({"cycle": n, "target_heat_at": now(), "nvml": temps}), flush=True)
@@ -294,12 +312,16 @@ def cycle(app, port, config, n, model):
                 stop.wait(.25)
         monitor = start_worker(monitor_gpu)
         sampler = start_worker(sample)
+        def ready_temperatures():
+            source_temp, target_temp = temperatures()
+            return 0 < source_temp <= source_limit and 0 < target_temp <= target_reuse
+
         try:
             deadline = time.monotonic() + args.cooldown_timeout
             while (not source_ready.exists() or (reverse and not target_ready.exists()) or
-                   max(temperatures()) > args.limit):
+                   not ready_temperatures()):
                 if time.monotonic() >= deadline:
-                    raise RuntimeError(f"GPUs did not cool to {args.limit} °C before admission: {temperatures()}")
+                    raise RuntimeError(f"GPUs did not cool to {source_limit}/{target_reuse} °C before admission: {temperatures()}")
                 time.sleep(.05)
             for attempt in range(5):
                 lead.clear()
@@ -315,7 +337,7 @@ def cycle(app, port, config, n, model):
                     break
                 conn.close()
                 old_requests.update(row["Metadata"]["request_id"] for row in current_audit())
-                while max(temperatures()) > args.limit and time.monotonic() < deadline:
+                while not ready_temperatures() and time.monotonic() < deadline:
                     time.sleep(.07)
             assert lead_thread.is_alive(), lead
             follow_conn = stack.enter_context(closing(HTTPConnection("127.0.0.1", port, timeout=540)))
@@ -371,7 +393,8 @@ def live(evidence):
     target_at = evidence.get("target_at", 0)
     lead_rows = [r for r in evidence["audit"] if r["EventType"] == "inference.policy"]
     checks = {
-        "nvml_crossing": bool(target_at and any(target_at - 10 <= t <= target_at and a > args.limit >= b > 0 for t, a, b in evidence["nvml"])),
+        "nvml_crossing": bool(target_at and any(target_at - 10 <= t <= target_at and a > source_limit and
+            0 < b <= target_reuse for t, a, b in evidence["nvml"])),
         "committed_source_to_target": lead.get("cuda_device_ordinal") == str(target_ordinal) and lead.get("gpu_migrations") == "1" and
             lead.get("gpu_migration_from_pci") == source and lead.get("gpu_migration_to_pci") == target,
         "canceled_after_target_page_in_before_token": len(abort.get("read_pairs", [])) >= 2 and
@@ -388,7 +411,15 @@ def live(evidence):
             follower.get("completion_id") == evidence["follower"].get("id"),
         "follower_left_no_kv": follower.get("kv_cuda_vram_bytes_after_dispose") == "0",
     }
+    if args.device_limits:
+        checks["per_device_limits_applied"] = accepted_limits(lead, source_limit, target_reuse)
     return checks
+
+
+def accepted_limits(record, running_limit, reuse_limit):
+    return (record.get("gpu_migration_source_temperature_limit_celsius") == str(running_limit) and
+        record.get("gpu_migration_target_temperature_limit_celsius") == str(reuse_limit) and
+        0 < int(record.get("gpu_migration_target_temperature_celsius", 0)) <= reuse_limit)
 
 
 def complete(outcome):
@@ -419,8 +450,10 @@ try:
                 evidence["checks"]["follower_returned_to_cool_source"] = (
                     successor.get("gpu_migrations") == "1" and successor.get("gpu_migration_from_pci") == target and
                     successor.get("gpu_migration_to_pci") == source and successor.get("cuda_device_ordinal") == str(source_ordinal) and
-                    bool(reverse_at and any(max(armed_at, reverse_at - 12) <= t <= reverse_at and 0 < r <= args.limit < x
-                        for t, r, x in evidence["nvml"])))
+                    bool(reverse_at and any(max(armed_at, reverse_at - 12) <= t <= reverse_at and
+                        0 < r <= source_reuse and x > target_limit for t, r, x in evidence["nvml"])))
+                if args.device_limits:
+                    evidence["checks"]["return_per_device_limits_applied"] = accepted_limits(successor, target_limit, source_reuse)
             save()
             print(json.dumps({"cycle": n, "checks": evidence["checks"], "lead": metadata(evidence, "canceled"),
                 "follower": evidence["follower"]["pieces"]}), flush=True)

@@ -13,7 +13,7 @@ def check(call, *args):
         raise RuntimeError(f"{call.__name__}: {status}")
 
 
-def run_heat(ordinal, pci_bus_id, threshold, seconds, arm_file, ready_file, stop_file, preheat):
+def run_heat(ordinal, pci_bus_id, threshold, seconds, arm_file, ready_file, stop_file, preheat, preheat_celsius):
     ptx = b"""
 .version 7.0
 .target sm_75
@@ -133,7 +133,7 @@ next_vec:
             print(json.dumps({"s": round(elapsed, 3), "active": active, "temperature": temp.value}), flush=True)
             if temp.value >= 84:
                 break
-            if not active and (not preheat or temp.value >= threshold - 2):
+            if not active and (not preheat or temp.value >= preheat_celsius):
                 time.sleep(0.18)
                 continue
             if active and (temp.value >= 83 or not preheat and (now - active_at) % 3.0 > 2.2):
@@ -162,7 +162,11 @@ if __name__ == "__main__":
     p.add_argument("--ready-file", type=Path)
     p.add_argument("--stop-file", type=Path)
     p.add_argument("--preheat", action="store_true")
+    p.add_argument("--preheat-celsius", type=int)
     a = p.parse_args()
     if not 0 < a.seconds <= 180 or not 3 <= a.threshold <= 82:
         p.error("workload duration or thermal threshold is out of range")
-    run_heat(a.ordinal, a.pci, a.threshold, a.seconds, a.arm_file, a.ready_file, a.stop_file, a.preheat)
+    preheat_celsius = a.threshold - 2 if a.preheat_celsius is None else a.preheat_celsius
+    if not 0 <= preheat_celsius < a.threshold:
+        p.error("preheat temperature must be below the running threshold")
+    run_heat(a.ordinal, a.pci, a.threshold, a.seconds, a.arm_file, a.ready_file, a.stop_file, a.preheat, preheat_celsius)
