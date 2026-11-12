@@ -286,6 +286,10 @@ the probe process and its VRAM are released. It then allows a background
 retry to finish and checks that admission and NVML temperatures recover in
 the same process, with zero dedicated VRAM during queries.
 
+The shutdown case sends Ctrl+C to Monolith while a retry is using both GPUs.
+It checks the parent exit code, the retry process exit, and zero dedicated
+VRAM after shutdown.
+
 After a failed startup probe, Monolith waits five seconds between attempts.
 Each attempt has a 15-second timeout. Until a complete CUDA inventory is
 available, local inference returns HTTP 503 with `cuda_device_unavailable`.

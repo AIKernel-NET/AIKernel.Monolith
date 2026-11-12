@@ -13,6 +13,7 @@ import re
 import runpy
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -223,18 +224,20 @@ def assert_unavailable(statuses):
         assert gpu["temperature_celsius"] is None, gpu
 
 
-def verify_probe_recovery(counter, process, log_path, port, key, first_probe_pid, release_path):
+def wait_for_retry_probe(process, log_path, first_probe_pid):
     deadline = time.monotonic() + 30
     while process.poll() is None and time.monotonic() < deadline:
         log = log_path.read_text(encoding="utf-8")
         retries = [int(pid) for pid, _ in FAULT_PROBE_MARKER.findall(log) if int(pid) != first_probe_pid]
         if retries:
-            assert_unavailable([admission(port, key, name) for name in ("first", "second")])
-            break
+            return retries[-1]
         time.sleep(0.05)
-    else:
-        raise AssertionError(f"Monolith did not start another CUDA probe: {log_path.read_text(encoding='utf-8')}")
+    raise AssertionError(f"Monolith did not start another CUDA probe: {log_path.read_text(encoding='utf-8')}")
 
+
+def verify_probe_recovery(counter, process, log_path, port, key, first_probe_pid, release_path):
+    wait_for_retry_probe(process, log_path, first_probe_pid)
+    assert_unavailable([admission(port, key, name) for name in ("first", "second")])
     release_path.touch()
 
     def query_models(first_sent):
@@ -277,6 +280,87 @@ def verify_probe_recovery(counter, process, log_path, port, key, first_probe_pid
     }
 
 
+def signal_console_shutdown(pid):
+    kernel = C.WinDLL("kernel32", use_last_error=True)
+    kernel.AttachConsole.argtypes = (W.DWORD,)
+    kernel.GetConsoleProcessList.argtypes = (C.POINTER(W.DWORD), W.DWORD)
+    kernel.GetConsoleProcessList.restype = W.DWORD
+    kernel.SetConsoleCtrlHandler.argtypes = (C.c_void_p, W.BOOL)
+    kernel.GenerateConsoleCtrlEvent.argtypes = (W.DWORD, W.DWORD)
+    if not kernel.FreeConsole() or not kernel.AttachConsole(pid):
+        raise C.WinError(C.get_last_error())
+    try:
+        attached = (W.DWORD * 8)()
+        count = kernel.GetConsoleProcessList(attached, len(attached))
+        # The control event reaches Monolith and this helper. The CUDA probe has no console.
+        assert count == 2 and set(attached[:count]) == {pid, os.getpid()}, list(attached[:count])
+        if not kernel.SetConsoleCtrlHandler(None, True) or not kernel.GenerateConsoleCtrlEvent(0, 0):
+            raise C.WinError(C.get_last_error())
+    finally:
+        kernel.FreeConsole()
+
+
+def wait_for_probe_vram(counter, pid):
+    deadline = time.monotonic() + 5
+    while True:
+        usage = counter.sample(pid)
+        if sum(value > 0 for value in usage.values()) >= 2:
+            return usage
+        assert time.monotonic() < deadline, usage
+        time.sleep(0.05)
+
+
+def wait_for_zero_vram(counter, *pids):
+    deadline = time.monotonic() + 3
+    while True:
+        usage = {pid: sum(counter.sample(pid).values()) for pid in pids}
+        if not any(usage.values()):
+            return usage
+        assert time.monotonic() < deadline, usage
+        time.sleep(0.05)
+
+
+def verify_shutdown_during_retry(counter, process, log_path, first_probe_pid):
+    retry_pid = wait_for_retry_probe(process, log_path, first_probe_pid)
+    kernel = process_api()
+    # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE
+    retry = kernel.OpenProcess(0x00101001, False, retry_pid)
+    if not retry:
+        raise C.WinError(C.get_last_error())
+    try:
+        retry_vram = wait_for_probe_vram(counter, retry_pid)
+        parent_vram = sum(counter.sample(process.pid).values())
+        assert parent_vram == 0, parent_vram
+        assert kernel.WaitForSingleObject(retry, 0) == 0x102, "Retry exited before shutdown"
+        signal = subprocess.run(
+            [sys.executable, "-c",
+             "import runpy,sys; runpy.run_path(sys.argv[1])['signal_console_shutdown'](int(sys.argv[2]))",
+             str(Path(__file__).resolve()), str(process.pid)],
+            creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, timeout=5)
+        assert signal.returncode == 0, (signal.returncode, signal.stdout, signal.stderr)
+        assert process.wait(timeout=8) == 0, log_path.read_text(encoding="utf-8")
+        log = log_path.read_text(encoding="utf-8")
+        assert "Application is shutting down" in log, log
+        assert "CUDA device enumeration timed out." not in log, log
+        assert [int(pid) for pid, _ in FAULT_PROBE_MARKER.findall(log)] == [first_probe_pid, retry_pid], log
+        assert kernel.WaitForSingleObject(retry, 0) == 0, f"CUDA retry {retry_pid} survived Monolith"
+        retry_exit = W.DWORD()
+        if not kernel.GetExitCodeProcess(retry, C.byref(retry_exit)):
+            raise C.WinError(C.get_last_error())
+        assert retry_exit.value != 0, retry_exit.value
+        usage = wait_for_zero_vram(counter, process.pid, first_probe_pid, retry_pid)
+        return {
+            "monolith_exit_code": process.returncode, "retry_pid": retry_pid,
+            "retry_exit_code": retry_exit.value, "monolith_vram_before_shutdown_bytes": parent_vram,
+            "retry_vram_before_shutdown_by_adapter": retry_vram, "vram_after_shutdown_bytes": usage,
+        }
+    finally:
+        if kernel.WaitForSingleObject(retry, 0) == 0x102:
+            kernel.TerminateProcess(retry, 1)
+            kernel.WaitForSingleObject(retry, 5000)
+        kernel.CloseHandle(retry)
+
+
 def verify_probe_fault(process, log_path, helpers, key, fault, release_path, prompt):
     probe_pid = wait_for_fault_probe(process, log_path)
     assert probe_pid != process.pid
@@ -287,36 +371,28 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
         raise C.WinError(C.get_last_error())
     try:
         with closing(DedicatedVramCounter()) as counter:
-            deadline = time.monotonic() + 5
-            while True:
-                before = counter.sample(probe_pid)
-                if sum(value > 0 for value in before.values()) >= 2:
-                    break
-                assert time.monotonic() < deadline, before
-                time.sleep(0.05)
+            before = wait_for_probe_vram(counter, probe_pid)
+            initial_timeout = fault == "timeout"
             assert kernel.WaitForSingleObject(handle, 0) == 0x102, "CUDA probe exited before fault injection"
             assert "Now listening on:" not in log_path.read_text(encoding="utf-8")
-            if fault == "abnormal-exit" and not kernel.TerminateProcess(handle, 73):
+            if not initial_timeout and not kernel.TerminateProcess(handle, 73):
                 raise C.WinError(C.get_last_error())
 
             port = helpers["wait_for_port"](process, log_path)
             log = log_path.read_text(encoding="utf-8")
             expected = (f"CUDA topology probe process {probe_pid} exited with code 73."
-                        if fault == "abnormal-exit" else "CUDA device enumeration timed out.")
+                        if not initial_timeout else "CUDA device enumeration timed out.")
             assert log.index(expected) < log.index("Now listening on:"), log
             assert kernel.WaitForSingleObject(handle, 0) == 0, f"CUDA probe {probe_pid} is still running"
             exit_code = W.DWORD()
             if not kernel.GetExitCodeProcess(handle, C.byref(exit_code)):
                 raise C.WinError(C.get_last_error())
-            if fault == "abnormal-exit":
+            if not initial_timeout:
                 assert exit_code.value == 73, exit_code.value
             else:
                 assert exit_code.value != 0, exit_code.value
 
-            deadline = time.monotonic() + 3
-            while probe_after := sum(counter.sample(probe_pid).values()):
-                assert time.monotonic() < deadline, probe_after
-                time.sleep(0.05)
+            probe_after = wait_for_zero_vram(counter, probe_pid)[probe_pid]
 
             def query_models(first_sent):
                 first = admission(port, key, "first", sent=first_sent)
@@ -335,14 +411,18 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
             assert_unavailable(statuses)
             probe_after_queries = sum(counter.sample(probe_pid).values())
             assert probe_after_queries == 0, probe_after_queries
-            recovery = verify_probe_recovery(counter, process, log_path, port, key, probe_pid, release_path)
-            return {
+            report = {
                 "fault": fault, "monolith_pid": process.pid, "probe_pid": probe_pid,
                 "probe_exit_code": exit_code.value, "probe_exited_before_listen": True,
                 "probe_vram_before_fault_by_adapter": before,
                 "probe_vram_after_exit_bytes": probe_after, "probe_vram_after_queries_bytes": probe_after_queries,
-                "dedicated_vram": measurement, "model_statuses": statuses, "recovery": recovery,
+                "dedicated_vram": measurement, "model_statuses": statuses,
             }
+            if fault == "shutdown":
+                report["shutdown"] = verify_shutdown_during_retry(counter, process, log_path, probe_pid)
+            else:
+                report["recovery"] = verify_probe_recovery(counter, process, log_path, port, key, probe_pid, release_path)
+            return report
     finally:
         if kernel.WaitForSingleObject(handle, 0) == 0x102:
             kernel.TerminateProcess(handle, 1)
@@ -398,11 +478,19 @@ def test(exe, assets, output, fault_library=None, fault=None):
             env["AIKERNEL_TEST_PROBE_RELEASE_FILE"] = str(release_path)
 
         log_path = output / "monolith.log"
+        startup = None
+        creationflags = subprocess.CREATE_NO_WINDOW
+        if fault == "shutdown":
+            startup = subprocess.STARTUPINFO()
+            startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startup.wShowWindow = subprocess.SW_HIDE
+            creationflags = subprocess.CREATE_NEW_CONSOLE
         with log_path.open("wb") as log:
             process = subprocess.Popen(
                 [str(executable), "--urls=http://127.0.0.1:0",
                  *[f"--{name}-root={mount}" for name, mount in mounts.items()]],
-                cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
+                cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT,
+                creationflags=creationflags, startupinfo=startup)
             try:
                 if fault is not None:
                     report = verify_probe_fault(process, log_path, helpers, key, fault, release_path,
@@ -480,12 +568,12 @@ if __name__ == "__main__":
     parser.add_argument("exe", type=Path)
     parser.add_argument("assets", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--probe-fault-library", type=Path, help="Run abnormal-exit and timeout cases with this DLL")
+    parser.add_argument("--probe-fault-library", type=Path, help="Run probe failure, recovery, and shutdown cases with this DLL")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("Windows GPU Process Memory counters are required")
     test(args.exe.resolve(), args.assets.resolve(), args.output.resolve())
     if args.probe_fault_library:
-        for fault in ("abnormal-exit", "timeout"):
+        for fault in ("abnormal-exit", "timeout", "shutdown"):
             test(args.exe.resolve(), args.assets.resolve(), args.output.resolve() / fault,
                  fault_library=args.probe_fault_library.resolve(), fault=fault)
