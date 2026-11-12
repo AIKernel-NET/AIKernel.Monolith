@@ -320,7 +320,7 @@ def wait_for_zero_vram(counter, *pids):
         time.sleep(0.05)
 
 
-def verify_shutdown_during_retry(counter, process, log_path, first_probe_pid):
+def verify_shutdown_during_retry(counter, process, log_path, first_probe_pid, forced):
     retry_pid = wait_for_retry_probe(process, log_path, first_probe_pid)
     kernel = process_api()
     # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE
@@ -332,25 +332,33 @@ def verify_shutdown_during_retry(counter, process, log_path, first_probe_pid):
         parent_vram = sum(counter.sample(process.pid).values())
         assert parent_vram == 0, parent_vram
         assert kernel.WaitForSingleObject(retry, 0) == 0x102, "Retry exited before shutdown"
-        signal = subprocess.run(
-            [sys.executable, "-c",
-             "import runpy,sys; runpy.run_path(sys.argv[1])['signal_console_shutdown'](int(sys.argv[2]))",
-             str(Path(__file__).resolve()), str(process.pid)],
-            creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, timeout=5)
-        assert signal.returncode == 0, (signal.returncode, signal.stdout, signal.stderr)
-        assert process.wait(timeout=8) == 0, log_path.read_text(encoding="utf-8")
+        if forced:
+            process.kill()  # Terminate only Monolith on Windows.
+        else:
+            signal = subprocess.run(
+                [sys.executable, "-c",
+                 "import runpy,sys; runpy.run_path(sys.argv[1])['signal_console_shutdown'](int(sys.argv[2]))",
+                 str(Path(__file__).resolve()), str(process.pid)],
+                creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, timeout=5)
+            assert signal.returncode == 0, (signal.returncode, signal.stdout, signal.stderr)
+
+        exit_code = process.wait(timeout=8)
         log = log_path.read_text(encoding="utf-8")
-        assert "Application is shutting down" in log, log
+        if forced:
+            assert exit_code != 0 and "Application is shutting down" not in log, (exit_code, log)
+        else:
+            assert exit_code == 0 and "Application is shutting down" in log, (exit_code, log)
         assert "CUDA device enumeration timed out." not in log, log
         assert [int(pid) for pid, _ in FAULT_PROBE_MARKER.findall(log)] == [first_probe_pid, retry_pid], log
-        assert kernel.WaitForSingleObject(retry, 0) == 0, f"CUDA retry {retry_pid} survived Monolith"
+        assert kernel.WaitForSingleObject(retry, 3000) == 0, f"CUDA retry {retry_pid} survived Monolith"
         retry_exit = W.DWORD()
         if not kernel.GetExitCodeProcess(retry, C.byref(retry_exit)):
             raise C.WinError(C.get_last_error())
-        assert retry_exit.value != 0, retry_exit.value
+        if not forced:
+            assert retry_exit.value != 0, retry_exit.value
         usage = wait_for_zero_vram(counter, process.pid, first_probe_pid, retry_pid)
         return {
-            "monolith_exit_code": process.returncode, "retry_pid": retry_pid,
+            "forced": forced, "monolith_exit_code": exit_code, "retry_pid": retry_pid,
             "retry_exit_code": retry_exit.value, "monolith_vram_before_shutdown_bytes": parent_vram,
             "retry_vram_before_shutdown_by_adapter": retry_vram, "vram_after_shutdown_bytes": usage,
         }
@@ -418,8 +426,9 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                 "probe_vram_after_exit_bytes": probe_after, "probe_vram_after_queries_bytes": probe_after_queries,
                 "dedicated_vram": measurement, "model_statuses": statuses,
             }
-            if fault == "shutdown":
-                report["shutdown"] = verify_shutdown_during_retry(counter, process, log_path, probe_pid)
+            if fault in ("shutdown", "forced-shutdown"):
+                report["shutdown"] = verify_shutdown_during_retry(
+                    counter, process, log_path, probe_pid, forced=fault == "forced-shutdown")
             else:
                 report["recovery"] = verify_probe_recovery(counter, process, log_path, port, key, probe_pid, release_path)
             return report
@@ -574,6 +583,6 @@ if __name__ == "__main__":
         parser.error("Windows GPU Process Memory counters are required")
     test(args.exe.resolve(), args.assets.resolve(), args.output.resolve())
     if args.probe_fault_library:
-        for fault in ("abnormal-exit", "timeout", "shutdown"):
+        for fault in ("abnormal-exit", "timeout", "shutdown", "forced-shutdown"):
             test(args.exe.resolve(), args.assets.resolve(), args.output.resolve() / fault,
                  fault_library=args.probe_fault_library.resolve(), fault=fault)

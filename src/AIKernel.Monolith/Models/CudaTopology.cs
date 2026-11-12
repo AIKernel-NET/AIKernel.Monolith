@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using AIKernel.Kernel.Memory;
 using AIKernel.Monolith.Internal;
@@ -9,12 +10,35 @@ namespace AIKernel.Monolith.Models;
 internal sealed class CudaTopology(ILogger<CudaTopology> logger)
 {
     internal const string ProbeArgument = "--probe-cuda-topology";
+    internal const string SupervisedProbeArgument = "--supervised";
+    private const byte StartProbe = 1;
 
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
     private string?[]? pciBusIds;
 
     // A null inventory means enumeration is unavailable. An empty inventory means no CUDA devices.
     internal string?[]? PciBusIds => Volatile.Read(ref pciBusIds);
+
+    internal static bool WaitForParent()
+    {
+        var lifetime = Console.OpenStandardInput();
+        if (lifetime.ReadByte() != StartProbe)
+            return false;
+
+        if (!OperatingSystem.IsWindows())
+        {
+            // The parent keeps the pipe open for the lifetime of this probe.
+            new Thread(() =>
+            {
+                try { lifetime.ReadByte(); }
+                catch (IOException) { }
+                using var self = Process.GetCurrentProcess();
+                self.Kill();
+            }) { IsBackground = true }.Start();
+        }
+
+        return true;
+    }
 
     internal static string?[]? Probe()
     {
@@ -53,23 +77,35 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
         {
             UseShellExecute = false,
             CreateNoWindow = true,
-            RedirectStandardOutput = true
+            RedirectStandardOutput = true,
+            RedirectStandardInput = true,
+            StandardInputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)
         };
         if (string.Equals(Path.GetFileNameWithoutExtension(executable), "dotnet", StringComparison.OrdinalIgnoreCase))
             start.ArgumentList.Add(Environment.GetCommandLineArgs()[0]);
         start.ArgumentList.Add(ProbeArgument);
+        start.ArgumentList.Add(SupervisedProbeArgument);
 
         try
         {
+            using var job = OperatingSystem.IsWindows() ? WindowsCudaProbeJob.Create() : null;
             using var process = Process.Start(start);
             if (process is null)
                 return;
 
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(TimeSpan.FromSeconds(15));
-            var output = process.StandardOutput.ReadToEndAsync(timeout.Token);
             try
             {
+                if (job is not null)
+                    WindowsCudaProbeJob.Assign(job, process);
+
+                // The child can initialize CUDA once it is covered by the parent's lifetime.
+                var lifetime = process.StandardInput.BaseStream;
+                lifetime.WriteByte(StartProbe);
+                lifetime.Flush();
+
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeout.CancelAfter(TimeSpan.FromSeconds(15));
+                var output = process.StandardOutput.ReadToEndAsync(timeout.Token);
                 await Task.WhenAll(process.WaitForExitAsync(timeout.Token), output);
                 logger.LogDebug("CUDA topology probe process {ProcessId} exited with code {ExitCode}.",
                     process.Id, process.ExitCode);

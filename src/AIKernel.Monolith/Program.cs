@@ -5,8 +5,11 @@ using AIKernel.Monolith.OpenAI;
 using AIKernel.Monolith.Models;
 using AIKernel.Monolith.Rag;
 
-if (args is [CudaTopology.ProbeArgument])
+if (args is [CudaTopology.ProbeArgument] or [CudaTopology.ProbeArgument, CudaTopology.SupervisedProbeArgument])
 {
+    if (args.Length == 2 && !CudaTopology.WaitForParent())
+        return 1;
+
     Console.Write(JsonSerializer.Serialize((object?)CudaTopology.Probe(), InferenceJsonContext.Default.CudaPciBusIds));
     return 0;
 }

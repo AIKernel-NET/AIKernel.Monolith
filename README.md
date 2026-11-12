@@ -290,6 +290,11 @@ The shutdown case sends Ctrl+C to Monolith while a retry is using both GPUs.
 It checks the parent exit code, the retry process exit, and zero dedicated
 VRAM after shutdown.
 
+The forced shutdown case terminates Monolith while a retry is using both GPUs.
+On Windows, each probe joins a Job Object before it initializes CUDA. The job
+ends the probe when Monolith exits. The test verifies that the retry exits
+and that the dedicated VRAM of both processes returns to 0 B.
+
 After a failed startup probe, Monolith waits five seconds between attempts.
 Each attempt has a 15-second timeout. Until a complete CUDA inventory is
 available, local inference returns HTTP 503 with `cuda_device_unavailable`.
