@@ -227,6 +227,30 @@ without relying on a change in room temperature or GPU load. Run it with
 the TinyStories checkpoint and tokenizer paths, followed by the source
 and destination CUDA ordinals.
 
+To exercise the same registered model twice using actual temperature changes,
+run the Windows Native AOT regression with Python 3.11 or later, two NVIDIA GPUs
+that support CUDA compute capability 7.5 or later, NVML, and `nvidia-smi` on
+`PATH`. Use an OpenLLaMA 3B v2 Q4_0 GGUF with its tokenizer embedded and a new
+or empty report directory on the SSD used for the swap files.
+
+```powershell
+python tests/native-aot-thermal-cancel.py <published-exe> <openllama-gguf> <report-directory> --devices 0 1 --limit 79 --return-margin 0
+```
+
+The test uses a bounded CUDA workload to reach the threshold and waits for the
+source GPU to cool before heating the target for the return migration. Set the
+threshold so that both GPUs can cross it under load and cool back to it between
+requests. Use `--cooldown-timeout` to allow a longer cooldown and
+`--return-margin` to set how far below the threshold the source must cool
+before the test starts heating the target. Each cycle queues a successor,
+disconnects the active request after SSD KV reads on the target and before the
+first token, and checks that CUDA
+released the KV allocations while retaining model weight allocations. The first
+successor must return to the source GPU before the second cycle can start under
+the same model ID and process. Both successors must match an isolated run using
+the same executable and checkpoint. The report directory contains `result.json`,
+inference audits, and the temperature and server logs.
+
 ## Retrieval-Augmented Generation
 
 RAG uses registered embedding and chat models. The same Monolith bearer token,
