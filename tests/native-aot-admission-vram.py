@@ -421,11 +421,16 @@ def verify_shutdown_during_retry(counter, process, log_path, first_probe_pid, fo
             assert exit_code == 0 and "Application is shutting down" in log, (exit_code, log)
         assert "CUDA device enumeration timed out." not in log, log
         assert [int(pid) for pid, _ in FAULT_PROBE_MARKER.findall(log)] == [first_probe_pid, retry_pid], log
-        assert kernel.WaitForSingleObject(retry, 3000) == 0, f"CUDA retry {retry_pid} survived Monolith"
+        # After a forced shutdown the job requests termination, then Windows finishes CUDA teardown.
+        child_wait_ms = 10000 if forced else 3000
+        assert kernel.WaitForSingleObject(retry, child_wait_ms) == 0, f"CUDA retry {retry_pid} survived Monolith"
         retry_exit = W.DWORD()
         if not kernel.GetExitCodeProcess(retry, C.byref(retry_exit)):
             raise C.WinError(C.get_last_error())
-        if not forced:
+        # A fixture that survives until its own watchdog expires exits with 74.
+        if forced:
+            assert retry_exit.value != 74, retry_exit.value
+        else:
             assert retry_exit.value != 0, retry_exit.value
         usage = wait_for_zero_vram(counter, process.pid, first_probe_pid, retry_pid)
         return {
@@ -460,6 +465,7 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                 "abnormal-exit-then-timeout": ("probe_timeout",),
                 "timeout-then-abnormal-exit": ("probe_nonzero_exit",),
                 "timeout-then-timeout": ("probe_timeout",),
+                "abnormal-exit-then-timeout-then-abnormal-exit": ("probe_timeout", "probe_nonzero_exit"),
                 "timeout-then-abnormal-exit-then-timeout": ("probe_nonzero_exit", "probe_timeout"),
             }.get(fault, ())
             port = helpers["wait_for_port"](process, log_path)
@@ -695,6 +701,7 @@ if __name__ == "__main__":
     if args.probe_fault_library:
         for fault in ("abnormal-exit", "timeout", "abnormal-exit-then-abnormal-exit",
                       "abnormal-exit-then-timeout", "timeout-then-abnormal-exit", "timeout-then-timeout",
-                      "timeout-then-abnormal-exit-then-timeout", "shutdown", "forced-shutdown"):
+                      "abnormal-exit-then-timeout-then-abnormal-exit", "timeout-then-abnormal-exit-then-timeout",
+                      "shutdown", "forced-shutdown"):
             test(args.exe.resolve(), args.assets.resolve(), args.output.resolve() / fault,
                  fault_library=args.probe_fault_library.resolve(), fault=fault)
