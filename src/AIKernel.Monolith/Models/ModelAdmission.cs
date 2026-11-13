@@ -23,8 +23,10 @@ internal sealed class ModelAdmission(IDecisionGate gate, PagedLlamaPool localMod
         var retryAfter = inventory is { PciBusIds: null } && reason == InferenceErrors.CudaDeviceUnavailable.Code
             ? CudaTopology.RetryDelaySeconds
             : InferenceErrors.GetRetryAfterSeconds(reason);
+        var nextRetry = inventory?.RemainingRetryDelay;
         return new(model.Metadata.Id, reason is null, reason, backend, device,
-            reason is null ? admissionDevice : null, retryAfter, devices, inventory?.State);
+            reason is null ? admissionDevice : null, retryAfter, devices, inventory?.State,
+            nextRetry.HasValue ? (int)Math.Ceiling(nextRetry.Value.TotalSeconds) : null, inventory?.LastFailure);
     }
 
     private (string Backend, int? Device, int? AdmissionDevice, string? Reason, GpuAdmissionStatus[] Devices)
@@ -115,7 +117,11 @@ internal sealed record ModelAdmissionStatus(
     [property: JsonPropertyName("retry_after_seconds")] int? RetryAfterSeconds,
     [property: JsonPropertyName("devices")] GpuAdmissionStatus[] Devices,
     [property: JsonPropertyName("cuda_topology_state")]
-    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CudaTopologyState);
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CudaTopologyState,
+    [property: JsonPropertyName("cuda_next_retry_in_seconds")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? CudaNextRetryInSeconds,
+    [property: JsonPropertyName("cuda_last_failure_reason")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CudaLastFailureReason);
 
 internal sealed record GpuAdmissionStatus(
     [property: JsonPropertyName("device")] int Device,

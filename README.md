@@ -235,6 +235,14 @@ For local models, `cuda_topology_state` is `retry_wait` between failed attempts,
 and `probing`, local inference returns HTTP 503 with `cuda_device_unavailable`
 and `Retry-After: 5`. Five seconds is the suggested polling interval.
 
+While waiting, `cuda_next_retry_in_seconds` counts down to the next attempt,
+rounded up to whole seconds. It is omitted while the probe is running.
+`cuda_last_failure_reason` describes the latest failed attempt and remains
+visible during the next probe. Its values are `probe_nonzero_exit`,
+`probe_timeout`, `probe_start_failed`, `probe_failed` (communication or
+process error), and `probe_invalid_inventory`. A successful probe clears both
+fields, including when it confirms there are no CUDA devices.
+
 For a local model, `device` is the current CUDA ordinal or the configured
 ordinal before the first load. `admission_device` is the GPU the health gate
 would choose, including an eligible recovery target after a failed migration.

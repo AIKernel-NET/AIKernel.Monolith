@@ -14,7 +14,6 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
     private const byte StartProbe = 1;
 
     internal const int RetryDelaySeconds = 5;
-    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(RetryDelaySeconds);
     private CudaTopologySnapshot snapshot = new(null);
 
     internal CudaTopologySnapshot Snapshot => Volatile.Read(ref snapshot);
@@ -57,9 +56,9 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
 
     internal async Task RetryUntilAvailableAsync(CancellationToken stoppingToken)
     {
-        while (Snapshot.PciBusIds is null)
+        while (Snapshot is { PciBusIds: null } waiting)
         {
-            await Task.Delay(RetryDelay, stoppingToken);
+            await Task.Delay(waiting.RemainingRetryDelay ?? TimeSpan.Zero, stoppingToken);
             await InitializeAsync(stoppingToken);
             if (Snapshot.PciBusIds is not null)
                 logger.LogInformation("CUDA device enumeration recovered.");
@@ -69,27 +68,28 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
     internal async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        // A short-lived process releases the CUDA driver's per-process GPU memory before the host accepts requests.
-        if (Environment.ProcessPath is not { } executable)
-            return;
-
-        var start = new ProcessStartInfo(executable)
-        {
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardInput = true,
-            StandardInputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)
-        };
-        if (string.Equals(Path.GetFileNameWithoutExtension(executable), "dotnet", StringComparison.OrdinalIgnoreCase))
-            start.ArgumentList.Add(Environment.GetCommandLineArgs()[0]);
-        start.ArgumentList.Add(ProbeArgument);
-        start.ArgumentList.Add(SupervisedProbeArgument);
-
+        var previousFailure = Snapshot.LastFailure;
         string?[]? pciBusIds = null;
-        Volatile.Write(ref snapshot, new(null, IsProbing: true));
+        var failure = "probe_start_failed";
+        Volatile.Write(ref snapshot, new(null, IsProbing: true, LastFailure: previousFailure));
         try
         {
+            // The probe process releases the driver's per-process GPU memory before the inventory is published.
+            if (Environment.ProcessPath is not { } executable)
+                return;
+            var start = new ProcessStartInfo(executable)
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardInput = true,
+                StandardInputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)
+            };
+            if (string.Equals(Path.GetFileNameWithoutExtension(executable), "dotnet", StringComparison.OrdinalIgnoreCase))
+                start.ArgumentList.Add(Environment.GetCommandLineArgs()[0]);
+            start.ArgumentList.Add(ProbeArgument);
+            start.ArgumentList.Add(SupervisedProbeArgument);
+
             using var job = OperatingSystem.IsWindows() ? WindowsCudaProbeJob.Create() : null;
             using var process = Process.Start(start);
             if (process is null)
@@ -100,6 +100,7 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
                 if (job is not null)
                     WindowsCudaProbeJob.Assign(job, process);
 
+                failure = "probe_failed";
                 // The child can initialize CUDA once it is covered by the parent's lifetime.
                 var lifetime = process.StandardInput.BaseStream;
                 lifetime.WriteByte(StartProbe);
@@ -112,8 +113,12 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
                 logger.LogDebug("CUDA topology probe process {ProcessId} exited with code {ExitCode}.",
                     process.Id, process.ExitCode);
                 if (process.ExitCode != 0)
+                {
+                    failure = "probe_nonzero_exit";
                     return;
+                }
 
+                failure = "probe_invalid_inventory";
                 var inventory = JsonSerializer.Deserialize(await output, InferenceJsonContext.Default.CudaPciBusIds);
                 if (inventory is not null && inventory.All(static pci => !string.IsNullOrWhiteSpace(pci)))
                     pciBusIds = inventory;
@@ -130,6 +135,7 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
+            failure = "probe_timeout";
             logger.LogWarning("CUDA device enumeration timed out.");
         }
         catch (Exception error) when (error is Win32Exception or InvalidOperationException or IOException or JsonException)
@@ -138,13 +144,30 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
         }
         finally
         {
-            Volatile.Write(ref snapshot, new(pciBusIds));
+            CudaTopologySnapshot completed = pciBusIds is not null ? new(pciBusIds)
+                : cancellationToken.IsCancellationRequested ? new(null, LastFailure: previousFailure)
+                : new(null, LastFailure: failure, RetryWaitStarted: Stopwatch.GetTimestamp());
+            Volatile.Write(ref snapshot, completed);
         }
     }
 }
 
-internal sealed record CudaTopologySnapshot(string?[]? PciBusIds, bool IsProbing = false)
+internal sealed record CudaTopologySnapshot(string?[]? PciBusIds, bool IsProbing = false,
+    string? LastFailure = null, long? RetryWaitStarted = null)
 {
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(CudaTopology.RetryDelaySeconds);
+
+    internal TimeSpan? RemainingRetryDelay
+    {
+        get
+        {
+            if (RetryWaitStarted is not long started)
+                return null;
+            var remaining = RetryDelay - Stopwatch.GetElapsedTime(started);
+            return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+        }
+    }
+
     internal string State => PciBusIds switch
     {
         { Length: 0 } => "no_devices",
