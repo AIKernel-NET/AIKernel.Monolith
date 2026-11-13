@@ -232,19 +232,21 @@ def assert_unavailable(statuses, topology_state, failure_reason):
         assert gpu["temperature_celsius"] is None, gpu
 
 
-def wait_for_retry_probe(process, log_path, first_probe_pid):
+def wait_for_retry_probe(process, log_path, previous_probe_pid):
     deadline = time.monotonic() + 30
     while process.poll() is None and time.monotonic() < deadline:
         log = log_path.read_text(encoding="utf-8")
-        retries = [int(pid) for pid, _ in FAULT_PROBE_MARKER.findall(log) if int(pid) != first_probe_pid]
-        if retries:
-            return retries[-1]
+        pids = [int(pid) for pid, _ in FAULT_PROBE_MARKER.findall(log)]
+        if previous_probe_pid in pids:
+            next_index = pids.index(previous_probe_pid) + 1
+            if next_index < len(pids):
+                return pids[next_index]
         time.sleep(0.05)
     raise AssertionError(f"Monolith did not start another CUDA probe: {log_path.read_text(encoding='utf-8')}")
 
 
-def verify_probe_recovery(counter, process, log_path, port, key, first_probe_pid, release_path, failure_reason):
-    wait_for_retry_probe(process, log_path, first_probe_pid)
+def verify_probe_recovery(counter, process, log_path, port, key, previous_probe_pid, release_path, failure_reason):
+    recovery_pid = wait_for_retry_probe(process, log_path, previous_probe_pid)
     probing = [admission(port, key, name) for name in ("first", "second")]
     assert_unavailable(probing, "probing", failure_reason)
     release_path.touch()
@@ -279,8 +281,8 @@ def verify_probe_recovery(counter, process, log_path, port, key, first_probe_pid
     log = log_path.read_text(encoding="utf-8")
     assert log.count("Now listening on:") == 1, log
     probe_pids = [int(pid) for pid, _ in FAULT_PROBE_MARKER.findall(log)]
-    assert len(probe_pids) >= 2 and probe_pids[0] == first_probe_pid, log
-    assert f"CUDA topology probe process {probe_pids[-1]} exited with code 0." in log, log
+    assert probe_pids[-2:] == [previous_probe_pid, recovery_pid], log
+    assert f"CUDA topology probe process {recovery_pid} exited with code 0." in log, log
     for pid in probe_pids:
         assert_process_stopped(pid)
     probe_vram = {pid: sum(counter.sample(pid).values()) for pid in probe_pids}
@@ -289,6 +291,48 @@ def verify_probe_recovery(counter, process, log_path, port, key, first_probe_pid
         "monolith_pid": process.pid, "probe_pids": probe_pids, "probe_vram_bytes": probe_vram,
         "dedicated_vram": measurement, "devices": devices, "model_statuses": [first, second],
         "probing_statuses": probing,
+    }
+
+
+def read_countdown(port, key, first_status, failure_reason, stop_at):
+    assert_unavailable([first_status], "retry_wait", failure_reason)
+    countdown = [first_status["cuda_next_retry_in_seconds"]]
+    deadline = time.monotonic() + 3
+    while countdown[-1] > stop_at:
+        assert time.monotonic() < deadline, countdown
+        time.sleep(0.1)
+        status = admission(port, key, "first")
+        assert_unavailable([status], "retry_wait", failure_reason)
+        remaining = status["cuda_next_retry_in_seconds"]
+        assert remaining <= countdown[-1], countdown + [remaining]
+        countdown.append(remaining)
+    return countdown
+
+
+def verify_retry_timeout(process, log_path, port, key, first_probe_pid, initial_remaining):
+    retry_pid = wait_for_retry_probe(process, log_path, first_probe_pid)
+    probing = admission(port, key, "first")
+    assert_unavailable([probing], "probing", "probe_nonzero_exit")
+
+    deadline = time.monotonic() + 20
+    while True:
+        status = admission(port, key, "first")
+        if status["cuda_topology_state"] == "retry_wait":
+            break
+        assert_unavailable([status], "probing", "probe_nonzero_exit")
+        assert process.poll() is None and time.monotonic() < deadline, status
+        time.sleep(0.1)
+
+    assert_unavailable([status], "retry_wait", "probe_timeout")
+    reset_remaining = status["cuda_next_retry_in_seconds"]
+    assert 4 <= reset_remaining <= 5 and reset_remaining > initial_remaining, (initial_remaining, status)
+    countdown = read_countdown(port, key, status, "probe_timeout", reset_remaining - 1)
+    assert_process_stopped(retry_pid)
+    log = log_path.read_text(encoding="utf-8")
+    assert log.index(f"ready pid={retry_pid} ") < log.index("CUDA device enumeration timed out."), log
+    return {
+        "probe_pid": retry_pid, "probing_status": probing, "retry_wait_status": status,
+        "retry_countdown_seconds": countdown,
     }
 
 
@@ -427,15 +471,10 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                     admission(port, key, "first")
                     admission(port, key, "second")
                     time.sleep(0.05)
-                countdown = [first["cuda_next_retry_in_seconds"]]
-                deadline = time.monotonic() + 2.5
-                while countdown[-1] == countdown[0]:
-                    assert time.monotonic() < deadline, countdown
-                    time.sleep(0.1)
-                    status = admission(port, key, "first")
-                    assert_unavailable([status], "retry_wait", failure_reason)
-                    countdown.append(status["cuda_next_retry_in_seconds"])
-                assert countdown[-1] < countdown[0], countdown
+                stop_at = first["cuda_next_retry_in_seconds"] - 1
+                if fault == "abnormal-exit-then-timeout":
+                    stop_at = min(stop_at, 3)
+                countdown = read_countdown(port, key, first, failure_reason, stop_at)
                 return [first, second], countdown
 
             (statuses, countdown), measurement = measure_queries(counter, process.pid, query_models)
@@ -454,8 +493,16 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                 report["shutdown"] = verify_shutdown_during_retry(
                     counter, process, log_path, probe_pid, forced=fault == "forced-shutdown")
             else:
+                previous_probe_pid = probe_pid
+                if fault == "abnormal-exit-then-timeout":
+                    timed_out = verify_retry_timeout(process, log_path, port, key, probe_pid, countdown[-1])
+                    report["timed_out_retry"] = timed_out
+                    previous_probe_pid = timed_out["probe_pid"]
+                    failure_reason = "probe_timeout"
                 report["recovery"] = verify_probe_recovery(
-                    counter, process, log_path, port, key, probe_pid, release_path, failure_reason)
+                    counter, process, log_path, port, key, previous_probe_pid, release_path, failure_reason)
+                expected_probes = 3 if fault == "abnormal-exit-then-timeout" else 2
+                assert len(set(report["recovery"]["probe_pids"])) == expected_probes, report
             return report
     finally:
         if kernel.WaitForSingleObject(handle, 0) == 0x102:
@@ -609,6 +656,6 @@ if __name__ == "__main__":
         parser.error("Windows GPU Process Memory counters are required")
     test(args.exe.resolve(), args.assets.resolve(), args.output.resolve())
     if args.probe_fault_library:
-        for fault in ("abnormal-exit", "timeout", "shutdown", "forced-shutdown"):
+        for fault in ("abnormal-exit", "timeout", "abnormal-exit-then-timeout", "shutdown", "forced-shutdown"):
             test(args.exe.resolve(), args.assets.resolve(), args.output.resolve() / fault,
                  fault_library=args.probe_fault_library.resolve(), fault=fault)
