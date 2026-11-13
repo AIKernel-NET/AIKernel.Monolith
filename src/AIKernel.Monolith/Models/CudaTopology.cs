@@ -129,8 +129,14 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
                 {
                     try { process.Kill(); }
                     catch (InvalidOperationException) when (process.HasExited) { }
-                    await process.WaitForExitAsync();
                 }
+
+                // Windows can expose an exit code while termination is still in progress.
+                // Wait on the process handle before accepting requests or publishing the inventory.
+                if (OperatingSystem.IsWindows())
+                    process.WaitForExit();
+                else
+                    await process.WaitForExitAsync();
             }
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)

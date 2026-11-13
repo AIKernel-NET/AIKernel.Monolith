@@ -443,15 +443,17 @@ def verify_shutdown_during_retry(counter, process, log_path, first_probe_pid, fo
 def verify_probe_fault(process, log_path, helpers, key, fault, release_path, prompt):
     probe_pid = wait_for_fault_probe(process, log_path)
     assert probe_pid != process.pid
+    initial_timeout = fault == "timeout" or fault.startswith("timeout-then-")
     kernel = process_api()
-    # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE
-    handle = kernel.OpenProcess(0x00101001, False, probe_pid)
-    if not handle:
-        raise C.WinError(C.get_last_error())
+    handle = None
+    if initial_timeout:
+        # Keep the handle for the exit status after Monolith times out the probe.
+        handle = kernel.OpenProcess(0x00101001, False, probe_pid)
+        if not handle:
+            raise C.WinError(C.get_last_error())
     try:
         with closing(DedicatedVramCounter()) as counter:
-            before = wait_for_probe_vram(counter, probe_pid)
-            initial_timeout = fault == "timeout" or fault.startswith("timeout-then-")
+            before = wait_for_probe_vram(counter, probe_pid) if initial_timeout else None
             failure_reason = "probe_timeout" if initial_timeout else "probe_nonzero_exit"
             retry_failures = {
                 "abnormal-exit-then-abnormal-exit": ("probe_nonzero_exit",),
@@ -460,25 +462,24 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                 "timeout-then-timeout": ("probe_timeout",),
                 "timeout-then-abnormal-exit-then-timeout": ("probe_nonzero_exit", "probe_timeout"),
             }.get(fault, ())
-            assert kernel.WaitForSingleObject(handle, 0) == 0x102, "CUDA probe exited before fault injection"
-            assert "Now listening on:" not in log_path.read_text(encoding="utf-8")
-            if not initial_timeout and not kernel.TerminateProcess(handle, 73):
-                raise C.WinError(C.get_last_error())
-
             port = helpers["wait_for_port"](process, log_path)
             log = log_path.read_text(encoding="utf-8")
             expected = (f"CUDA topology probe process {probe_pid} exited with code 73."
                         if not initial_timeout else "CUDA device enumeration timed out.")
-            assert log.index(expected) < log.index("Now listening on:"), log
-            # Allow Windows to finish terminating the probe before sampling its VRAM.
-            assert kernel.WaitForSingleObject(handle, 1000) == 0, f"CUDA probe {probe_pid} is still running"
-            exit_code = W.DWORD()
-            if not kernel.GetExitCodeProcess(handle, C.byref(exit_code)):
-                raise C.WinError(C.get_last_error())
-            if not initial_timeout:
-                assert exit_code.value == 73, exit_code.value
-            else:
+            assert expected in log.split("Now listening on:", 1)[0], log
+            allocated = {pci: int(size) for size, pci in
+                         re.findall(rf"CUDA probe {probe_pid} allocated ([0-9]+) B on ([0-9a-fA-F:.]+)", log)}
+            assert len(allocated) >= 2 and all(allocated.values()), log
+            if handle:
+                assert kernel.WaitForSingleObject(handle, 1000) == 0, f"CUDA probe {probe_pid} is still running"
+                exit_code = W.DWORD()
+                if not kernel.GetExitCodeProcess(handle, C.byref(exit_code)):
+                    raise C.WinError(C.get_last_error())
                 assert exit_code.value != 0, exit_code.value
+                probe_exit_code = exit_code.value
+            else:
+                assert_process_stopped(probe_pid)
+                probe_exit_code = 73
 
             probe_after = wait_for_zero_vram(counter, probe_pid)[probe_pid]
 
@@ -506,7 +507,8 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
             assert probe_after_queries == 0, probe_after_queries
             report = {
                 "fault": fault, "monolith_pid": process.pid, "probe_pid": probe_pid,
-                "probe_exit_code": exit_code.value, "probe_exited_before_listen": True,
+                "probe_exit_code": probe_exit_code, "probe_exited_before_listen": True,
+                "probe_cuda_allocated_bytes_by_pci": allocated,
                 "probe_vram_before_fault_by_adapter": before,
                 "probe_vram_after_exit_bytes": probe_after, "probe_vram_after_queries_bytes": probe_after_queries,
                 "dedicated_vram": measurement, "model_statuses": statuses,
@@ -537,10 +539,11 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                 assert len(set(report["recovery"]["probe_pids"])) == expected_probes, report
             return report
     finally:
-        if kernel.WaitForSingleObject(handle, 0) == 0x102:
-            kernel.TerminateProcess(handle, 1)
-            kernel.WaitForSingleObject(handle, 5000)
-        kernel.CloseHandle(handle)
+        if handle:
+            if kernel.WaitForSingleObject(handle, 0) == 0x102:
+                kernel.TerminateProcess(handle, 1)
+                kernel.WaitForSingleObject(handle, 5000)
+            kernel.CloseHandle(handle)
 
 
 def test(exe, assets, output, fault_library=None, fault=None):
@@ -589,6 +592,8 @@ def test(exe, assets, output, fault_library=None, fault=None):
             shutil.copyfile(exe.with_name("aikernel_cuda_driver.dll"), real_driver)
             env["AIKERNEL_TEST_REAL_CUDA_LIBRARY"] = str(real_driver)
             env["AIKERNEL_TEST_PROBE_RELEASE_FILE"] = str(release_path)
+            if not fault.startswith("timeout"):
+                env["AIKERNEL_TEST_PROBE_FIRST_EXIT_FILE"] = str(work / "first-probe-exited")
 
         log_path = output / "monolith.log"
         startup = None
