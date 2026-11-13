@@ -454,6 +454,7 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
             initial_timeout = fault in ("timeout", "timeout-then-abnormal-exit", "timeout-then-timeout")
             failure_reason = "probe_timeout" if initial_timeout else "probe_nonzero_exit"
             retry_failure = {
+                "abnormal-exit-then-abnormal-exit": "probe_nonzero_exit",
                 "abnormal-exit-then-timeout": "probe_timeout",
                 "timeout-then-abnormal-exit": "probe_nonzero_exit",
                 "timeout-then-timeout": "probe_timeout",
@@ -678,7 +679,8 @@ if __name__ == "__main__":
         parser.error("Windows GPU Process Memory counters are required")
     test(args.exe.resolve(), args.assets.resolve(), args.output.resolve())
     if args.probe_fault_library:
-        for fault in ("abnormal-exit", "timeout", "abnormal-exit-then-timeout", "timeout-then-abnormal-exit",
-                      "timeout-then-timeout", "shutdown", "forced-shutdown"):
+        for fault in ("abnormal-exit", "timeout", "abnormal-exit-then-abnormal-exit",
+                      "abnormal-exit-then-timeout", "timeout-then-abnormal-exit", "timeout-then-timeout",
+                      "shutdown", "forced-shutdown"):
             test(args.exe.resolve(), args.assets.resolve(), args.output.resolve() / fault,
                  fault_library=args.probe_fault_library.resolve(), fault=fault)
