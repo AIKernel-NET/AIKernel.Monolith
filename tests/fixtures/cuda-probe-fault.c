@@ -74,9 +74,16 @@ __declspec(dllexport) int32_t ak_get_device_count(int32_t *count)
     wchar_t release[32768];
     DWORD release_length = GetEnvironmentVariableW(L"AIKERNEL_TEST_PROBE_RELEASE_FILE",
         release, ARRAYSIZE(release));
+    wchar_t abort_path[32768];
+    int abort_length = -1;
+    if (release_length > 0 && release_length < ARRAYSIZE(release))
+        abort_length = swprintf_s(abort_path, ARRAYSIZE(abort_path), L"%ls.%lu.exit-73",
+            release, GetCurrentProcessId());
     ULONGLONG deadline = GetTickCount64() + 30000;
     while (GetTickCount64() < deadline)
     {
+        if (abort_length > 0 && GetFileAttributesW(abort_path) != INVALID_FILE_ATTRIBUTES)
+            ExitProcess(73);
         if (release_length > 0 && release_length < ARRAYSIZE(release) &&
             GetFileAttributesW(release) != INVALID_FILE_ATTRIBUTES)
             ExitProcess(0);

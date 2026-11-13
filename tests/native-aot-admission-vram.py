@@ -310,21 +310,14 @@ def read_countdown(port, key, first_status, failure_reason, stop_at):
 
 
 def verify_retry_failure(process, log_path, port, key, previous_probe_pid, previous_remaining,
-                         previous_failure, retry_failure):
+                         previous_failure, retry_failure, release_path):
     retry_pid = wait_for_retry_probe(process, log_path, previous_probe_pid)
     probing = admission(port, key, "first")
     assert_unavailable([probing], "probing", previous_failure)
 
     if retry_failure == "probe_nonzero_exit":
-        kernel = process_api()
-        handle = kernel.OpenProcess(0x00000001, False, retry_pid)  # PROCESS_TERMINATE
-        if not handle:
-            raise C.WinError(C.get_last_error())
-        try:
-            if not kernel.TerminateProcess(handle, 73):
-                raise C.WinError(C.get_last_error())
-        finally:
-            kernel.CloseHandle(handle)
+        # Let the fixture exit itself, as it does for an abnormal startup probe.
+        release_path.with_suffix(f".{retry_pid}.exit-73").touch()
         expected_log = f"CUDA topology probe process {retry_pid} exited with code 73."
     else:
         expected_log = "CUDA device enumeration timed out."
@@ -465,6 +458,7 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                 "abnormal-exit-then-timeout": ("probe_timeout",),
                 "timeout-then-abnormal-exit": ("probe_nonzero_exit",),
                 "timeout-then-timeout": ("probe_timeout",),
+                "abnormal-exit-then-abnormal-exit-then-abnormal-exit": ("probe_nonzero_exit", "probe_nonzero_exit"),
                 "abnormal-exit-then-timeout-then-abnormal-exit": ("probe_timeout", "probe_nonzero_exit"),
                 "timeout-then-abnormal-exit-then-timeout": ("probe_nonzero_exit", "probe_timeout"),
                 "timeout-then-timeout-then-timeout": ("probe_timeout", "probe_timeout"),
@@ -530,7 +524,8 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                 failed_retries = []
                 for retry_failure in retry_failures:
                     failed = verify_retry_failure(
-                        process, log_path, port, key, previous_probe_pid, previous_remaining, failure_reason, retry_failure)
+                        process, log_path, port, key, previous_probe_pid, previous_remaining,
+                        failure_reason, retry_failure, release_path)
                     failed_retries.append(failed)
                     previous_probe_pid = failed["probe_pid"]
                     previous_remaining = failed["retry_countdown_seconds"][-1]
@@ -702,6 +697,7 @@ if __name__ == "__main__":
     if args.probe_fault_library:
         for fault in ("abnormal-exit", "timeout", "abnormal-exit-then-abnormal-exit",
                       "abnormal-exit-then-timeout", "timeout-then-abnormal-exit", "timeout-then-timeout",
+                      "abnormal-exit-then-abnormal-exit-then-abnormal-exit",
                       "abnormal-exit-then-timeout-then-abnormal-exit", "timeout-then-abnormal-exit-then-timeout",
                       "timeout-then-timeout-then-timeout", "shutdown", "forced-shutdown"):
             test(args.exe.resolve(), args.assets.resolve(), args.output.resolve() / fault,
