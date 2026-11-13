@@ -224,9 +224,16 @@ when the client retries.
 Use `GET /v1/models/admission?model=<model-id>` with the Monolith bearer token
 to check a model without starting inference. A registered model returns
 HTTP 200 with `admissible`, a `reason` when blocked, and `retry_after_seconds`
-for thermal denials. An unregistered model returns HTTP 404. The response is
-a fresh snapshot of the model policy and route. Prompt-dependent resource
-admission and GPU lease acquisition happen when an inference request arrives.
+for thermal denials and CUDA discovery failures. An unregistered model returns
+HTTP 404. The response is a fresh snapshot of the model policy and route.
+Prompt-dependent resource admission and GPU lease acquisition happen when an
+inference request arrives.
+
+For local models, `cuda_topology_state` is `retry_wait` between failed attempts,
+`probing` while enumeration is running, `ready` once CUDA devices are known, or
+`no_devices` when no CUDA driver or device is available. During `retry_wait`
+and `probing`, local inference returns HTTP 503 with `cuda_device_unavailable`
+and `Retry-After: 5`. Five seconds is the suggested polling interval.
 
 For a local model, `device` is the current CUDA ordinal or the configured
 ordinal before the first load. `admission_device` is the GPU the health gate

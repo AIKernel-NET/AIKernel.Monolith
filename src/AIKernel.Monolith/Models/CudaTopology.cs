@@ -13,11 +13,11 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
     internal const string SupervisedProbeArgument = "--supervised";
     private const byte StartProbe = 1;
 
-    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
-    private string?[]? pciBusIds;
+    internal const int RetryDelaySeconds = 5;
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(RetryDelaySeconds);
+    private CudaTopologySnapshot snapshot = new(null);
 
-    // A null inventory means enumeration is unavailable. An empty inventory means no CUDA devices.
-    internal string?[]? PciBusIds => Volatile.Read(ref pciBusIds);
+    internal CudaTopologySnapshot Snapshot => Volatile.Read(ref snapshot);
 
     internal static bool WaitForParent()
     {
@@ -57,11 +57,11 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
 
     internal async Task RetryUntilAvailableAsync(CancellationToken stoppingToken)
     {
-        while (PciBusIds is null)
+        while (Snapshot.PciBusIds is null)
         {
             await Task.Delay(RetryDelay, stoppingToken);
             await InitializeAsync(stoppingToken);
-            if (PciBusIds is not null)
+            if (Snapshot.PciBusIds is not null)
                 logger.LogInformation("CUDA device enumeration recovered.");
         }
     }
@@ -86,6 +86,8 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
         start.ArgumentList.Add(ProbeArgument);
         start.ArgumentList.Add(SupervisedProbeArgument);
 
+        string?[]? pciBusIds = null;
+        Volatile.Write(ref snapshot, new(null, IsProbing: true));
         try
         {
             using var job = OperatingSystem.IsWindows() ? WindowsCudaProbeJob.Create() : null;
@@ -114,7 +116,7 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
 
                 var inventory = JsonSerializer.Deserialize(await output, InferenceJsonContext.Default.CudaPciBusIds);
                 if (inventory is not null && inventory.All(static pci => !string.IsNullOrWhiteSpace(pci)))
-                    Volatile.Write(ref pciBusIds, inventory);
+                    pciBusIds = inventory;
             }
             finally
             {
@@ -134,7 +136,21 @@ internal sealed class CudaTopology(ILogger<CudaTopology> logger)
         {
             logger.LogWarning(error, "CUDA device enumeration failed.");
         }
+        finally
+        {
+            Volatile.Write(ref snapshot, new(pciBusIds));
+        }
     }
+}
+
+internal sealed record CudaTopologySnapshot(string?[]? PciBusIds, bool IsProbing = false)
+{
+    internal string State => PciBusIds switch
+    {
+        { Length: 0 } => "no_devices",
+        not null => "ready",
+        _ => IsProbing ? "probing" : "retry_wait"
+    };
 }
 
 internal sealed class CudaTopologyRetryService(CudaTopology topology, ModelProviderRegistry registry) : BackgroundService

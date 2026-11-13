@@ -274,6 +274,17 @@ def smoke(exe, assets, output, cpu_only, oversized_device):
             try:
                 port = helpers["wait_for_port"](process, log_path)
 
+                if cpu_only:
+                    with closing(HTTPConnection("127.0.0.1", port, timeout=10)) as connection:
+                        connection.request("GET", "/v1/models/admission?model=gpu-gguf",
+                                           headers={"Authorization": f"Bearer {KEY}"})
+                        response = connection.getresponse()
+                        admission = json.loads(response.read())
+                        assert response.status == 200, admission
+                        assert admission["cuda_topology_state"] == "no_devices", admission
+                        assert admission["admissible"] and admission["backend"] == "cpu", admission
+                        assert admission["retry_after_seconds"] is None and admission["devices"] == [], admission
+
                 def request(model, status=200, prompt=PROMPT, timeout=150):
                     body = json.dumps({"model": model, "prompt": prompt})
                     with closing(HTTPConnection("127.0.0.1", port, timeout=timeout)) as connection:

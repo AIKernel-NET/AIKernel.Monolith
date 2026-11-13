@@ -162,7 +162,7 @@ internal sealed class GovernedModelInference(
             T? value;
             if (model.Local is { } local)
             {
-                if (topology.PciBusIds is null)
+                if (topology.Snapshot.PciBusIds is null)
                     return await RejectAsync(InferenceErrors.CudaDeviceUnavailable);
 
                 var result = await executeLocal!(local, metadata, cancellationToken);
@@ -274,7 +274,7 @@ internal static class InferenceErrors
     internal static readonly InferenceError UnsupportedLocalModel =
         new(422, "unsupported_model_format", "The local model format or encoding is unsupported.");
     internal static readonly InferenceError CudaDeviceUnavailable =
-        new(503, "cuda_device_unavailable", "The CUDA device inventory is unavailable.");
+        new(503, "cuda_device_unavailable", "The CUDA device inventory is unavailable.", CudaTopology.RetryDelaySeconds);
     internal static readonly InferenceError LocalMemoryExhausted =
         new(503, "local_memory_exhausted", "The local model could not allocate memory.");
     internal static readonly InferenceError InvalidEmbeddingRequest =

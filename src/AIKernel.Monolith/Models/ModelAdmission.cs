@@ -13,33 +13,41 @@ internal sealed class ModelAdmission(IDecisionGate gate, PagedLlamaPool localMod
     {
         var operation = model.Metadata.Kind == "embedding" ? "embeddings" : "chat.completions";
         var (policyAllowed, _) = await GovernedModelInference.EvaluatePolicyAsync(gate, model, operation, requestId, token);
+        var inventory = model.Local is null ? null : topology.Snapshot;
         (string backend, int? device, int? admissionDevice, string? reason, GpuAdmissionStatus[] devices) = model.Local is { } settings
-            ? ReadLocal(settings, localModels.GetPlacement(model.Metadata.Id), token)
+            ? ReadLocal(settings, localModels.GetPlacement(model.Metadata.Id), inventory!.PciBusIds, token)
             : ("external", null, null, CredentialError(model), Array.Empty<GpuAdmissionStatus>());
         if (!policyAllowed)
             reason = InferenceErrors.PolicyDenied.Code;
 
+        var retryAfter = inventory is { PciBusIds: null } && reason == InferenceErrors.CudaDeviceUnavailable.Code
+            ? CudaTopology.RetryDelaySeconds
+            : InferenceErrors.GetRetryAfterSeconds(reason);
         return new(model.Metadata.Id, reason is null, reason, backend, device,
-            reason is null ? admissionDevice : null, InferenceErrors.GetRetryAfterSeconds(reason), devices);
+            reason is null ? admissionDevice : null, retryAfter, devices, inventory?.State);
     }
 
     private (string Backend, int? Device, int? AdmissionDevice, string? Reason, GpuAdmissionStatus[] Devices)
-        ReadLocal(PagedLlamaSettings settings, PagedLlamaPlacement? placement, CancellationToken token)
+        ReadLocal(PagedLlamaSettings settings, PagedLlamaPlacement? placement, string?[]? visibleDevices, CancellationToken token)
     {
-        using var telemetry = NvmlDeviceTelemetry.Open().Value;
-        var visibleDevices = topology.PciBusIds;
         var ordinal = placement is null ? settings.Device : placement.Device;
-        var sampled = new Dictionary<int, DeviceAdmission>();
-        if (visibleDevices is not null)
+        if (visibleDevices is null)
         {
-            for (var index = 0; index < visibleDevices.Length; index++)
-            {
-                token.ThrowIfCancellationRequested();
-                sampled.Add(index, ReadDevice(index, visibleDevices[index], settings, telemetry, placement));
-            }
+            GpuAdmissionStatus[] unavailable = ordinal is int configured
+                ? [ReadDevice(configured, null, settings, null, null).Status]
+                : [];
+            return ("unknown", ordinal, null, InferenceErrors.CudaDeviceUnavailable.Code, unavailable);
         }
 
-        if (ordinal is int current && !sampled.ContainsKey(current) && (placement is not null || visibleDevices is null))
+        using var telemetry = visibleDevices.Length == 0 ? null : NvmlDeviceTelemetry.Open().Value;
+        var sampled = new Dictionary<int, DeviceAdmission>();
+        for (var index = 0; index < visibleDevices.Length; index++)
+        {
+            token.ThrowIfCancellationRequested();
+            sampled.Add(index, ReadDevice(index, visibleDevices[index], settings, telemetry, placement));
+        }
+
+        if (ordinal is int current && !sampled.ContainsKey(current) && placement is not null)
             sampled.Add(current, ReadDevice(current, null, settings, telemetry, placement));
 
         var devices = sampled.Values.Select(device => device.Status).ToArray();
@@ -86,7 +94,7 @@ internal sealed class ModelAdmission(IDecisionGate gate, PagedLlamaPool localMod
         var target = DeviceHealthPolicy.Evaluate(health, targetLimits, settings.Priority);
         var status = new GpuAdmissionStatus(ordinal, pci, health.IsSuccess ? health.Value.TemperatureCelsius : null,
             limits.MaximumTemperatureCelsius, targetLimits.MaximumTemperatureCelsius, allowed,
-            allowed && target.IsSuccess, health.Error?.Code);
+            allowed && pci is not null && target.IsSuccess, health.Error?.Code);
         return new(active || pci is not null, execution.Error?.Code, status);
     }
 
@@ -105,7 +113,9 @@ internal sealed record ModelAdmissionStatus(
     [property: JsonPropertyName("device")] int? Device,
     [property: JsonPropertyName("admission_device")] int? AdmissionDevice,
     [property: JsonPropertyName("retry_after_seconds")] int? RetryAfterSeconds,
-    [property: JsonPropertyName("devices")] GpuAdmissionStatus[] Devices);
+    [property: JsonPropertyName("devices")] GpuAdmissionStatus[] Devices,
+    [property: JsonPropertyName("cuda_topology_state")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CudaTopologyState);
 
 internal sealed record GpuAdmissionStatus(
     [property: JsonPropertyName("device")] int Device,

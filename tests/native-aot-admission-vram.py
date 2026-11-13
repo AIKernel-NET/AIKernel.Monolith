@@ -182,7 +182,7 @@ def measure_queries(counter, pid, query):
     return responses, measurement
 
 
-def send(port, key, method, path, body=None, sent=None, expected_status=200):
+def send(port, key, method, path, body=None, sent=None, expected_status=200, retry_after=None):
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     with closing(HTTPConnection("127.0.0.1", port, timeout=60)) as connection:
         connection.request(method, path, body, headers)
@@ -191,6 +191,8 @@ def send(port, key, method, path, body=None, sent=None, expected_status=200):
         response = connection.getresponse()
         payload = json.loads(response.read())
         assert response.status == expected_status, (response.status, payload)
+        if retry_after is not None:
+            assert response.getheader("Retry-After") == str(retry_after), payload
         return payload
 
 
@@ -214,10 +216,11 @@ def wait_for_fault_probe(process, log_path):
     raise RuntimeError(log_path.read_text(encoding="utf-8", errors="replace"))
 
 
-def assert_unavailable(statuses):
+def assert_unavailable(statuses, topology_state):
     for ordinal, status in enumerate(statuses):
         assert not status["admissible"] and status["reason"] == "cuda_device_unavailable", status
         assert status["backend"] == "unknown" and status["admission_device"] is None, status
+        assert status["cuda_topology_state"] == topology_state and status["retry_after_seconds"] == 5, status
         assert [gpu["device"] for gpu in status["devices"]] == [ordinal], status
         gpu = status["devices"][0]
         assert not gpu["migration_target_eligible"] and gpu["pci_bus_id"] is None, gpu
@@ -237,7 +240,7 @@ def wait_for_retry_probe(process, log_path, first_probe_pid):
 
 def verify_probe_recovery(counter, process, log_path, port, key, first_probe_pid, release_path):
     wait_for_retry_probe(process, log_path, first_probe_pid)
-    assert_unavailable([admission(port, key, name) for name in ("first", "second")])
+    assert_unavailable([admission(port, key, name) for name in ("first", "second")], "probing")
     release_path.touch()
 
     def query_models(first_sent):
@@ -260,6 +263,7 @@ def verify_probe_recovery(counter, process, log_path, port, key, first_probe_pid
     (first, second), measurement = measure_queries(counter, process.pid, query_models)
     for ordinal, status in enumerate((first, second)):
         assert status["backend"] == "cuda" and status["reason"] is None, status
+        assert status["cuda_topology_state"] == "ready" and status["retry_after_seconds"] is None, status
         assert status["device"] == status["admission_device"] == ordinal, status
     devices = verify_devices(first)
     verify_devices(second)
@@ -407,8 +411,9 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                 second = admission(port, key, "second")
                 for name in ("first", "second"):
                     rejection = send(port, key, "POST", "/v1/completions",
-                                     json.dumps({"model": name, "prompt": prompt}), expected_status=503)
+                                     json.dumps({"model": name, "prompt": prompt}), expected_status=503, retry_after=5)
                     assert rejection["error"]["code"] == "cuda_device_unavailable", rejection
+                    assert rejection["error"]["retry_after_seconds"] == 5, rejection
                 for _ in range(5):
                     admission(port, key, "first")
                     admission(port, key, "second")
@@ -416,7 +421,7 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                 return first, second
 
             statuses, measurement = measure_queries(counter, process.pid, query_models)
-            assert_unavailable(statuses)
+            assert_unavailable(statuses, "retry_wait")
             probe_after_queries = sum(counter.sample(probe_pid).values())
             assert probe_after_queries == 0, probe_after_queries
             report = {
@@ -532,6 +537,7 @@ def test(exe, assets, output, fault_library=None, fault=None):
                     for ordinal, status in enumerate((first, second)):
                         assert status["admissible"] and status["backend"] == "cuda", status
                         assert status["device"] == status["admission_device"] == ordinal, status
+                        assert status["cuda_topology_state"] == "ready" and status["retry_after_seconds"] is None, status
                     assert not hot["admissible"] and hot["admission_device"] is None, hot
                     assert hot["reason"] == "device_temperature_exceeded" and hot["retry_after_seconds"] == 5, hot
                     devices = verify_devices(first)
