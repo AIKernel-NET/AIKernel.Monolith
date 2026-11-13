@@ -467,6 +467,7 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                 "timeout-then-timeout": ("probe_timeout",),
                 "abnormal-exit-then-timeout-then-abnormal-exit": ("probe_timeout", "probe_nonzero_exit"),
                 "timeout-then-abnormal-exit-then-timeout": ("probe_nonzero_exit", "probe_timeout"),
+                "timeout-then-timeout-then-timeout": ("probe_timeout", "probe_timeout"),
             }.get(fault, ())
             port = helpers["wait_for_port"](process, log_path)
             log = log_path.read_text(encoding="utf-8")
@@ -702,6 +703,6 @@ if __name__ == "__main__":
         for fault in ("abnormal-exit", "timeout", "abnormal-exit-then-abnormal-exit",
                       "abnormal-exit-then-timeout", "timeout-then-abnormal-exit", "timeout-then-timeout",
                       "abnormal-exit-then-timeout-then-abnormal-exit", "timeout-then-abnormal-exit-then-timeout",
-                      "shutdown", "forced-shutdown"):
+                      "timeout-then-timeout-then-timeout", "shutdown", "forced-shutdown"):
             test(args.exe.resolve(), args.assets.resolve(), args.output.resolve() / fault,
                  fault_library=args.probe_fault_library.resolve(), fault=fault)
