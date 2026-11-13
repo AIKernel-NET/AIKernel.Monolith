@@ -9,19 +9,28 @@ typedef int32_t (*create_fn)(uint32_t, int32_t, void **);
 typedef int32_t (*alloc_fn)(void *, size_t, uint64_t *);
 typedef int32_t (*wipe_fn)(void *, uint64_t, size_t);
 
-static int claim_first_exit(void)
+static int claim_attempt(const wchar_t *release)
 {
-    wchar_t path[32768];
-    DWORD length = GetEnvironmentVariableW(L"AIKERNEL_TEST_PROBE_FIRST_EXIT_FILE", path, ARRAYSIZE(path));
-    if (length == 0)
-        return 0;
-    if (length >= ARRAYSIZE(path))
+    wchar_t sequence[32];
+    DWORD length = GetEnvironmentVariableW(L"AIKERNEL_TEST_PROBE_FAILURE_SEQUENCE", sequence, ARRAYSIZE(sequence));
+    if (length == 0 || length >= ARRAYSIZE(sequence))
         return -1;
-    HANDLE marker = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (marker == INVALID_HANDLE_VALUE)
-        return GetLastError() == ERROR_FILE_EXISTS ? 0 : -1;
-    CloseHandle(marker);
-    return 1;
+
+    wchar_t path[32768];
+    for (DWORD attempt = 0; attempt < length; ++attempt)
+    {
+        if (swprintf_s(path, ARRAYSIZE(path), L"%ls.attempt-%lu", release, attempt) < 0)
+            return -1;
+        HANDLE marker = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (marker != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(marker);
+            return sequence[attempt];
+        }
+        if (GetLastError() != ERROR_FILE_EXISTS)
+            return -1;
+    }
+    return 0;
 }
 
 /* Initialize the real CUDA driver and leave valid topology on stdout while
@@ -44,8 +53,12 @@ __declspec(dllexport) int32_t ak_get_device_count(int32_t *count)
     wipe_fn wipe = (wipe_fn)GetProcAddress(driver, "ak_wipe_device");
     if (!get_count || !get_pci || !create || !allocate || !wipe || get_count(count) != 0 || *count < 2)
         ExitProcess(74);
-    int first_exit = claim_first_exit();
-    if (first_exit < 0)
+    wchar_t release[32768];
+    DWORD release_length = GetEnvironmentVariableW(L"AIKERNEL_TEST_PROBE_RELEASE_FILE", release, ARRAYSIZE(release));
+    if (release_length == 0 || release_length >= ARRAYSIZE(release))
+        ExitProcess(74);
+    int attempt = claim_attempt(release);
+    if (attempt < 0)
         ExitProcess(74);
 
     const size_t bytes = 8 * 1024 * 1024;
@@ -55,37 +68,30 @@ __declspec(dllexport) int32_t ak_get_device_count(int32_t *count)
         char pci[32] = { 0 };
         void *context = NULL;
         uint64_t address = 0;
-        if (get_pci(ordinal, pci, sizeof(pci)) != 0 ||
-            create(1, ordinal, &context) != 0 || allocate(context, bytes, &address) != 0 ||
-            wipe(context, address, bytes) != 0)
+        if (get_pci(ordinal, pci, sizeof(pci)) != 0)
             ExitProcess(74);
+        if (attempt == L'A')
+        {
+            if (create(1, ordinal, &context) != 0 || allocate(context, bytes, &address) != 0 ||
+                wipe(context, address, bytes) != 0)
+                ExitProcess(74);
+            fprintf(stderr, "CUDA probe %lu allocated %zu B on %s\n", GetCurrentProcessId(), bytes, pci);
+        }
         printf("%s\"%s\"", ordinal == 0 ? "" : ",", pci);
-        fprintf(stderr, "CUDA probe %lu allocated %zu B on %s\n", GetCurrentProcessId(), bytes, pci);
     }
     fputc(']', stdout);
     fflush(stdout);
     fprintf(stderr, "CUDA probe fault fixture ready pid=%lu devices=%ld\n",
         GetCurrentProcessId(), (long)*count);
     fflush(stderr);
-    if (first_exit)
+    if (attempt == L'E')
         ExitProcess(73);
 
-    // Keep the allocations live until the test releases the probe or Monolith terminates it.
-    wchar_t release[32768];
-    DWORD release_length = GetEnvironmentVariableW(L"AIKERNEL_TEST_PROBE_RELEASE_FILE",
-        release, ARRAYSIZE(release));
-    wchar_t abort_path[32768];
-    int abort_length = -1;
-    if (release_length > 0 && release_length < ARRAYSIZE(release))
-        abort_length = swprintf_s(abort_path, ARRAYSIZE(abort_path), L"%ls.%lu.exit-73",
-            release, GetCurrentProcessId());
+    // Keep the probe alive until the test releases it or Monolith terminates it.
     ULONGLONG deadline = GetTickCount64() + 30000;
     while (GetTickCount64() < deadline)
     {
-        if (abort_length > 0 && GetFileAttributesW(abort_path) != INVALID_FILE_ATTRIBUTES)
-            ExitProcess(73);
-        if (release_length > 0 && release_length < ARRAYSIZE(release) &&
-            GetFileAttributesW(release) != INVALID_FILE_ATTRIBUTES)
+        if (GetFileAttributesW(release) != INVALID_FILE_ATTRIBUTES)
             ExitProcess(0);
         Sleep(50);
     }

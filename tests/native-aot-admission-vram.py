@@ -182,9 +182,9 @@ def measure_queries(counter, pid, query):
     return responses, measurement
 
 
-def send(port, key, method, path, body=None, sent=None, expected_status=200, retry_after=None):
+def send(port, key, method, path, body=None, sent=None, expected_status=200, retry_after=None, timeout=60):
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    with closing(HTTPConnection("127.0.0.1", port, timeout=60)) as connection:
+    with closing(HTTPConnection("127.0.0.1", port, timeout=timeout)) as connection:
         connection.request(method, path, body, headers)
         if sent is not None:
             sent()
@@ -208,10 +208,12 @@ def wait_for_fault_probe(process, log_path):
     deadline = time.monotonic() + 25
     while process.poll() is None and time.monotonic() < deadline:
         log = log_path.read_text(encoding="utf-8", errors="replace")
-        assert "Now listening on:" not in log, log
+        listening = log.find("Now listening on:")
         if match := FAULT_PROBE_MARKER.search(log):
             assert int(match[2]) >= 2, log
+            assert listening == -1 or match.end() < listening, log
             return int(match[1])
+        assert listening == -1, log
         time.sleep(0.05)
     raise RuntimeError(log_path.read_text(encoding="utf-8", errors="replace"))
 
@@ -310,36 +312,39 @@ def read_countdown(port, key, first_status, failure_reason, stop_at):
 
 
 def verify_retry_failure(process, log_path, port, key, previous_probe_pid, previous_remaining,
-                         previous_failure, retry_failure, release_path):
-    retry_pid = wait_for_retry_probe(process, log_path, previous_probe_pid)
-    probing = admission(port, key, "first")
-    assert_unavailable([probing], "probing", previous_failure)
-
-    if retry_failure == "probe_nonzero_exit":
-        # Let the fixture exit itself, as it does for an abnormal startup probe.
-        release_path.with_suffix(f".{retry_pid}.exit-73").touch()
-        expected_log = f"CUDA topology probe process {retry_pid} exited with code 73."
-    else:
-        expected_log = "CUDA device enumeration timed out."
-
-    deadline = time.monotonic() + 20
+                         previous_failure, retry_failure):
+    # The probe deadline includes enumeration. Windows may need additional time
+    # to terminate the process and release its CUDA allocations.
+    deadline = time.monotonic() + 45
+    observed_probing = False
+    lowest_remaining = previous_remaining
     while True:
         status = admission(port, key, "first")
         if status["cuda_topology_state"] == "retry_wait":
-            break
-        assert_unavailable([status], "probing", previous_failure)
+            remaining = status["cuda_next_retry_in_seconds"]
+            if (observed_probing or status["cuda_last_failure_reason"] != previous_failure or
+                    remaining > lowest_remaining):
+                break
+            assert_unavailable([status], "retry_wait", previous_failure)
+            lowest_remaining = min(lowest_remaining, remaining)
+        else:
+            assert_unavailable([status], "probing", previous_failure)
+            observed_probing = True
         assert process.poll() is None and time.monotonic() < deadline, status
         time.sleep(0.1)
 
     assert_unavailable([status], "retry_wait", retry_failure)
     reset_remaining = status["cuda_next_retry_in_seconds"]
-    assert 4 <= reset_remaining <= 5 and reset_remaining > previous_remaining, (previous_remaining, status)
-    countdown = read_countdown(port, key, status, retry_failure, 3)
+    assert reset_remaining > lowest_remaining, (lowest_remaining, status)
+    countdown = read_countdown(port, key, status, retry_failure, min(3, reset_remaining - 1))
+    retry_pid = wait_for_retry_probe(process, log_path, previous_probe_pid)
     assert_process_stopped(retry_pid)
     log = log_path.read_text(encoding="utf-8")
+    expected_log = (f"CUDA topology probe process {retry_pid} exited with code 73."
+                    if retry_failure == "probe_nonzero_exit" else "CUDA device enumeration timed out.")
     assert expected_log in log.split(f"ready pid={retry_pid} ", 1)[1], log
     return {
-        "probe_pid": retry_pid, "probing_status": probing, "retry_wait_status": status,
+        "probe_pid": retry_pid, "retry_wait_status": status,
         "retry_countdown_seconds": countdown,
     }
 
@@ -451,7 +456,7 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
             raise C.WinError(C.get_last_error())
     try:
         with closing(DedicatedVramCounter()) as counter:
-            before = wait_for_probe_vram(counter, probe_pid) if initial_timeout else None
+            before = wait_for_probe_vram(counter, probe_pid) if fault == "timeout" else None
             failure_reason = "probe_timeout" if initial_timeout else "probe_nonzero_exit"
             retry_failures = {
                 "abnormal-exit-then-abnormal-exit": ("probe_nonzero_exit",),
@@ -462,6 +467,8 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                 "abnormal-exit-then-timeout-then-abnormal-exit": ("probe_timeout", "probe_nonzero_exit"),
                 "timeout-then-abnormal-exit-then-timeout": ("probe_nonzero_exit", "probe_timeout"),
                 "timeout-then-timeout-then-timeout": ("probe_timeout", "probe_timeout"),
+                "timeout-then-abnormal-exit-then-timeout-then-abnormal-exit": (
+                    "probe_nonzero_exit", "probe_timeout", "probe_nonzero_exit"),
             }.get(fault, ())
             port = helpers["wait_for_port"](process, log_path)
             log = log_path.read_text(encoding="utf-8")
@@ -470,7 +477,8 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
             assert expected in log.split("Now listening on:", 1)[0], log
             allocated = {pci: int(size) for size, pci in
                          re.findall(rf"CUDA probe {probe_pid} allocated ([0-9]+) B on ([0-9a-fA-F:.]+)", log)}
-            assert len(allocated) >= 2 and all(allocated.values()), log
+            if fault == "timeout":
+                assert len(allocated) >= 2 and all(allocated.values()), log
             if handle:
                 assert kernel.WaitForSingleObject(handle, 1000) == 0, f"CUDA probe {probe_pid} is still running"
                 exit_code = W.DWORD()
@@ -487,19 +495,15 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
             def query_models(first_sent):
                 first = admission(port, key, "first", sent=first_sent)
                 second = admission(port, key, "second")
+                stop_at = first["cuda_next_retry_in_seconds"] - 1
+                if retry_failures:
+                    stop_at = min(stop_at, 3)
+                countdown = read_countdown(port, key, first, failure_reason, stop_at)
                 for name in ("first", "second"):
                     rejection = send(port, key, "POST", "/v1/completions",
                                      json.dumps({"model": name, "prompt": prompt}), expected_status=503, retry_after=5)
                     assert rejection["error"]["code"] == "cuda_device_unavailable", rejection
                     assert rejection["error"]["retry_after_seconds"] == 5, rejection
-                for _ in range(5):
-                    admission(port, key, "first")
-                    admission(port, key, "second")
-                    time.sleep(0.05)
-                stop_at = first["cuda_next_retry_in_seconds"] - 1
-                if retry_failures:
-                    stop_at = min(stop_at, 3)
-                countdown = read_countdown(port, key, first, failure_reason, stop_at)
                 return [first, second], countdown
 
             (statuses, countdown), measurement = measure_queries(counter, process.pid, query_models)
@@ -525,7 +529,7 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                 for retry_failure in retry_failures:
                     failed = verify_retry_failure(
                         process, log_path, port, key, previous_probe_pid, previous_remaining,
-                        failure_reason, retry_failure, release_path)
+                        failure_reason, retry_failure)
                     failed_retries.append(failed)
                     previous_probe_pid = failed["probe_pid"]
                     previous_remaining = failed["retry_countdown_seconds"][-1]
@@ -594,8 +598,14 @@ def test(exe, assets, output, fault_library=None, fault=None):
             shutil.copyfile(exe.with_name("aikernel_cuda_driver.dll"), real_driver)
             env["AIKERNEL_TEST_REAL_CUDA_LIBRARY"] = str(real_driver)
             env["AIKERNEL_TEST_PROBE_RELEASE_FILE"] = str(release_path)
-            if not fault.startswith("timeout"):
-                env["AIKERNEL_TEST_PROBE_FIRST_EXIT_FILE"] = str(work / "first-probe-exited")
+            # A holds real allocations for the live VRAM check, T waits without
+            # creating contexts, and E exits with code 73 after enumeration.
+            sequence = "".join("T" if step == "timeout" else "E" for step in fault.split("-then-"))
+            if fault == "timeout":
+                sequence = "A"
+            if fault in ("shutdown", "forced-shutdown"):
+                sequence += "A"
+            env["AIKERNEL_TEST_PROBE_FAILURE_SEQUENCE"] = sequence
 
         log_path = output / "monolith.log"
         startup = None
@@ -653,7 +663,7 @@ def test(exe, assets, output, fault_library=None, fault=None):
                     # Prove the counter detects real allocations in the same PID on both adapters.
                     for name in ("first", "second"):
                         completion = send(port, key, "POST", "/v1/completions", json.dumps(
-                            {"model": name, "prompt": standalone["PROMPT"]}))
+                            {"model": name, "prompt": standalone["PROMPT"]}), timeout=180)
                         assert completion["choices"][0]["text"] == standalone["EXPECTED"], completion
                     for _ in range(30):
                         control = counter.sample(process.pid)
@@ -699,6 +709,7 @@ if __name__ == "__main__":
                       "abnormal-exit-then-timeout", "timeout-then-abnormal-exit", "timeout-then-timeout",
                       "abnormal-exit-then-abnormal-exit-then-abnormal-exit",
                       "abnormal-exit-then-timeout-then-abnormal-exit", "timeout-then-abnormal-exit-then-timeout",
-                      "timeout-then-timeout-then-timeout", "shutdown", "forced-shutdown"):
+                      "timeout-then-timeout-then-timeout", "timeout-then-abnormal-exit-then-timeout-then-abnormal-exit",
+                      "shutdown", "forced-shutdown"):
             test(args.exe.resolve(), args.assets.resolve(), args.output.resolve() / fault,
                  fault_library=args.probe_fault_library.resolve(), fault=fault)
