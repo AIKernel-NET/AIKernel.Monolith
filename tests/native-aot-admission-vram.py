@@ -309,9 +309,9 @@ def read_countdown(port, key, first_status, failure_reason, stop_at):
     return countdown
 
 
-def verify_retry_failure(process, log_path, port, key, first_probe_pid, initial_remaining,
+def verify_retry_failure(process, log_path, port, key, previous_probe_pid, previous_remaining,
                          previous_failure, retry_failure):
-    retry_pid = wait_for_retry_probe(process, log_path, first_probe_pid)
+    retry_pid = wait_for_retry_probe(process, log_path, previous_probe_pid)
     probing = admission(port, key, "first")
     assert_unavailable([probing], "probing", previous_failure)
 
@@ -340,8 +340,8 @@ def verify_retry_failure(process, log_path, port, key, first_probe_pid, initial_
 
     assert_unavailable([status], "retry_wait", retry_failure)
     reset_remaining = status["cuda_next_retry_in_seconds"]
-    assert 4 <= reset_remaining <= 5 and reset_remaining > initial_remaining, (initial_remaining, status)
-    countdown = read_countdown(port, key, status, retry_failure, reset_remaining - 1)
+    assert 4 <= reset_remaining <= 5 and reset_remaining > previous_remaining, (previous_remaining, status)
+    countdown = read_countdown(port, key, status, retry_failure, 3)
     assert_process_stopped(retry_pid)
     log = log_path.read_text(encoding="utf-8")
     assert expected_log in log.split(f"ready pid={retry_pid} ", 1)[1], log
@@ -451,14 +451,15 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
     try:
         with closing(DedicatedVramCounter()) as counter:
             before = wait_for_probe_vram(counter, probe_pid)
-            initial_timeout = fault in ("timeout", "timeout-then-abnormal-exit", "timeout-then-timeout")
+            initial_timeout = fault == "timeout" or fault.startswith("timeout-then-")
             failure_reason = "probe_timeout" if initial_timeout else "probe_nonzero_exit"
-            retry_failure = {
-                "abnormal-exit-then-abnormal-exit": "probe_nonzero_exit",
-                "abnormal-exit-then-timeout": "probe_timeout",
-                "timeout-then-abnormal-exit": "probe_nonzero_exit",
-                "timeout-then-timeout": "probe_timeout",
-            }.get(fault)
+            retry_failures = {
+                "abnormal-exit-then-abnormal-exit": ("probe_nonzero_exit",),
+                "abnormal-exit-then-timeout": ("probe_timeout",),
+                "timeout-then-abnormal-exit": ("probe_nonzero_exit",),
+                "timeout-then-timeout": ("probe_timeout",),
+                "timeout-then-abnormal-exit-then-timeout": ("probe_nonzero_exit", "probe_timeout"),
+            }.get(fault, ())
             assert kernel.WaitForSingleObject(handle, 0) == 0x102, "CUDA probe exited before fault injection"
             assert "Now listening on:" not in log_path.read_text(encoding="utf-8")
             if not initial_timeout and not kernel.TerminateProcess(handle, 73):
@@ -469,7 +470,8 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
             expected = (f"CUDA topology probe process {probe_pid} exited with code 73."
                         if not initial_timeout else "CUDA device enumeration timed out.")
             assert log.index(expected) < log.index("Now listening on:"), log
-            assert kernel.WaitForSingleObject(handle, 0) == 0, f"CUDA probe {probe_pid} is still running"
+            # Allow Windows to finish terminating the probe before sampling its VRAM.
+            assert kernel.WaitForSingleObject(handle, 1000) == 0, f"CUDA probe {probe_pid} is still running"
             exit_code = W.DWORD()
             if not kernel.GetExitCodeProcess(handle, C.byref(exit_code)):
                 raise C.WinError(C.get_last_error())
@@ -493,7 +495,7 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                     admission(port, key, "second")
                     time.sleep(0.05)
                 stop_at = first["cuda_next_retry_in_seconds"] - 1
-                if retry_failure is not None:
+                if retry_failures:
                     stop_at = min(stop_at, 3)
                 countdown = read_countdown(port, key, first, failure_reason, stop_at)
                 return [first, second], countdown
@@ -515,16 +517,23 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                     counter, process, log_path, probe_pid, forced=fault == "forced-shutdown")
             else:
                 previous_probe_pid = probe_pid
-                if retry_failure is not None:
+                previous_remaining = countdown[-1]
+                failed_retries = []
+                for retry_failure in retry_failures:
                     failed = verify_retry_failure(
-                        process, log_path, port, key, probe_pid, countdown[-1], failure_reason, retry_failure)
-                    report_key = "timed_out_retry" if retry_failure == "probe_timeout" else "abnormal_exit_retry"
-                    report[report_key] = failed
+                        process, log_path, port, key, previous_probe_pid, previous_remaining, failure_reason, retry_failure)
+                    failed_retries.append(failed)
                     previous_probe_pid = failed["probe_pid"]
+                    previous_remaining = failed["retry_countdown_seconds"][-1]
                     failure_reason = retry_failure
+                if len(failed_retries) == 1:
+                    report_key = "timed_out_retry" if failure_reason == "probe_timeout" else "abnormal_exit_retry"
+                    report[report_key] = failed_retries[0]
+                elif failed_retries:
+                    report["failed_retries"] = failed_retries
                 report["recovery"] = verify_probe_recovery(
                     counter, process, log_path, port, key, previous_probe_pid, release_path, failure_reason)
-                expected_probes = 3 if retry_failure is not None else 2
+                expected_probes = 2 + len(retry_failures)
                 assert len(set(report["recovery"]["probe_pids"])) == expected_probes, report
             return report
     finally:
@@ -681,6 +690,6 @@ if __name__ == "__main__":
     if args.probe_fault_library:
         for fault in ("abnormal-exit", "timeout", "abnormal-exit-then-abnormal-exit",
                       "abnormal-exit-then-timeout", "timeout-then-abnormal-exit", "timeout-then-timeout",
-                      "shutdown", "forced-shutdown"):
+                      "timeout-then-abnormal-exit-then-timeout", "shutdown", "forced-shutdown"):
             test(args.exe.resolve(), args.assets.resolve(), args.output.resolve() / fault,
                  fault_library=args.probe_fault_library.resolve(), fault=fault)
