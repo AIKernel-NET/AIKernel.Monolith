@@ -467,6 +467,8 @@ def verify_probe_fault(process, log_path, helpers, key, fault, release_path, pro
                 "abnormal-exit-then-timeout-then-abnormal-exit": ("probe_timeout", "probe_nonzero_exit"),
                 "timeout-then-abnormal-exit-then-timeout": ("probe_nonzero_exit", "probe_timeout"),
                 "timeout-then-timeout-then-timeout": ("probe_timeout", "probe_timeout"),
+                "abnormal-exit-then-timeout-then-abnormal-exit-then-timeout": (
+                    "probe_timeout", "probe_nonzero_exit", "probe_timeout"),
                 "timeout-then-abnormal-exit-then-timeout-then-abnormal-exit": (
                     "probe_nonzero_exit", "probe_timeout", "probe_nonzero_exit"),
             }.get(fault, ())
@@ -710,6 +712,7 @@ if __name__ == "__main__":
                       "abnormal-exit-then-abnormal-exit-then-abnormal-exit",
                       "abnormal-exit-then-timeout-then-abnormal-exit", "timeout-then-abnormal-exit-then-timeout",
                       "timeout-then-timeout-then-timeout", "timeout-then-abnormal-exit-then-timeout-then-abnormal-exit",
+                      "abnormal-exit-then-timeout-then-abnormal-exit-then-timeout",
                       "shutdown", "forced-shutdown"):
             test(args.exe.resolve(), args.assets.resolve(), args.output.resolve() / fault,
                  fault_library=args.probe_fault_library.resolve(), fault=fault)
