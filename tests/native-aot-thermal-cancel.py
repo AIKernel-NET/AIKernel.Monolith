@@ -1,5 +1,6 @@
 """Verify thermal migration, cancellation, and recovery on real GPUs."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing
 import ctypes as c
 from ctypes import wintypes as w
@@ -164,6 +165,7 @@ WEIGHT_BLOCK_BYTES = 32 * 1024 * 1024
 WEIGHT_VRAM_BLOCKS = 8
 KV_VRAM_BLOCKS = 26
 KV_PAGE_BYTES = 64 * 1024
+ADMISSION_BATCH_SIZE = 3
 
 
 def launch(folder, stack, baseline=False, initial_device=None):
@@ -483,9 +485,13 @@ def reuse_rejection():
         def execution_rows():
             return [row for row in audit(config) if row["EventType"] == "inference.execution"]
 
+        def ready_to_start():
+            source_temp, target_temp = temperatures()
+            return (source_ready.exists() and target_ready.exists() and
+                0 < source_temp <= source_limit and 0 < target_temp <= target_limit)
+
         try:
-            wait_until(lambda: source_ready.exists() and target_ready.exists() and 0 < temperatures()[1] <= target_limit,
-                args.cooldown_timeout, "the workloads and a cool initial GPU")
+            wait_until(ready_to_start, args.cooldown_timeout, "the workloads and both GPUs within their running limits")
             client = stack.enter_context(closing(HTTPConnection("127.0.0.1", port, timeout=380)))
             lead_thread = start_worker(request, client, evidence["model"], "Hello. " * 12 + "How are you?", lead)
             wait_until(lambda: any(row["EventType"] == "inference.policy" for row in audit(config)), 12, "lead admission")
@@ -542,29 +548,56 @@ def reuse_rejection():
                     return True
                 return False
 
-            intermediate = evidence["admission_rejection"] = {}
-            with closing(HTTPConnection("127.0.0.1", port, timeout=25)) as admission_client:
-                admission_client.connect()
-                wait_until(ready_for_admission_rejection, min(args.cooldown_timeout, 60),
-                    "a hot current GPU and a destination still in the rejection band")
-                request(admission_client, evidence["model"], "Once", intermediate)
-            wait_until(lambda: len(execution_rows()) >= 2, 5, "the admission rejection audit")
-            evidence["admission_rejection_audit"] = refused = execution_rows()[1]
-            record = refused["Metadata"]
+            batch = evidence["admission_rejections"] = [{} for _ in range(ADMISSION_BATCH_SIZE)]
+            send_together = threading.Barrier(ADMISSION_BATCH_SIZE + 1)
+
+            def send_probe(connection, outcome):
+                try:
+                    send_together.wait()
+                except threading.BrokenBarrierError:
+                    return
+                request(connection, evidence["model"], "Once", outcome)
+
+            with ExitStack() as admission_stack:
+                clients = [admission_stack.enter_context(closing(HTTPConnection("127.0.0.1", port, timeout=25)))
+                    for _ in batch]
+                for client in clients:
+                    client.connect()
+                with ThreadPoolExecutor(max_workers=len(batch)) as workers:
+                    pending = [workers.submit(send_probe, client, outcome) for client, outcome in zip(clients, batch)]
+                    try:
+                        wait_until(ready_for_admission_rejection, min(args.cooldown_timeout, 60),
+                            "a hot current GPU and a destination still in the rejection band")
+                        send_together.wait(timeout=5)
+                    except BaseException:
+                        send_together.abort()
+                        raise
+                    for task in pending:
+                        task.result(timeout=30)
+
+            before_recovery = 1 + len(batch)
+            wait_until(lambda: len(execution_rows()) >= before_recovery, 5, "the admission rejection audits")
+            evidence["admission_rejection_audits"] = refused = execution_rows()[1:]
+            records = [row["Metadata"] for row in refused]
             # The resource gate and KV creation follow the thermal check at admission.
             evidence["admission_rejection_checks"] = admission_checks = {
-                "rejected_at_admission": intermediate.get("http") == 503 and
-                    intermediate.get("error", {}).get("code") == "device_thermal_migration_unavailable" and
-                    refused["Description"] == "device_thermal_migration_unavailable" and
+                "requests_overlapped": max(outcome["sent_at"] for outcome in batch) <= min(outcome["ended_at"] for outcome in batch),
+                "all_received_http_503": all(outcome.get("http") == 503 and
+                    outcome.get("error", {}).get("code") == "device_thermal_migration_unavailable" and
+                    not outcome["events"] for outcome in batch),
+                "all_rejected_at_admission": len(refused) == len(batch) and all(
+                    row["Description"] == "device_thermal_migration_unavailable" and
                     record.get("cuda_device_ordinal") == str(target_ordinal) and
                     "device_temperature_celsius" not in record and "resource_minimum_vram_blocks" not in record and
-                    "gpu_migrations" not in record and not intermediate["events"],
-                "warm_destination_rejected_again": rejected_for_reuse_limit(record),
-                "no_kv_allocated_at_admission": "kv_cuda_vram_bytes_before_dispose" not in record and not swaps(config),
+                    "gpu_migrations" not in record for row, record in zip(refused, records)),
+                "warm_destination_rejected_for_every_request": all(rejected_for_reuse_limit(record) for record in records),
+                "no_kv_allocated_at_admission": all("kv_cuda_vram_bytes_before_dispose" not in record
+                    for record in records) and not swaps(config),
             }
-            print(json.dumps({"event": "admission_rejected", "checks": admission_checks,
+            print(json.dumps({"event": "admission_batch_rejected", "checks": admission_checks,
                 "nvml": evidence["admission_rejection_nvml"],
-                "temperature": record.get("gpu_migration_last_thermal_rejection_temperature_celsius")}), flush=True)
+                "temperatures": [record.get("gpu_migration_last_thermal_rejection_temperature_celsius")
+                    for record in records]}), flush=True)
             assert all(admission_checks.values()), admission_checks
             source_stop.touch()
 
@@ -588,14 +621,15 @@ def reuse_rejection():
             target_stop.touch()
             follower_thread.join(330)
             assert not follower_thread.is_alive(), "Recovery request did not complete"
-            wait_until(lambda: len(execution_rows()) >= 3, 5, "the recovery terminal audit")
-            evidence["recovery_audit"] = recovered = execution_rows()[2]
+            wait_until(lambda: len(execution_rows()) > before_recovery, 5, "the recovery terminal audit")
+            rows = execution_rows()
+            evidence["recovery_audit"] = recovered = rows[before_recovery]
             record = recovered["Metadata"]
             evidence["remaining_swap"] = swaps(config)
             evidence["checks"] = {
                 "same_process_same_model": app.poll() is None and
-                    recovered["Subject"] == refused["Subject"] == rejected["Subject"] == evidence["model"] and
-                    len({row["Metadata"]["request_id"] for row in (rejected, refused, recovered)}) == 3,
+                    len(rows) == before_recovery + 1 and all(row["Subject"] == evidence["model"] for row in rows) and
+                    len({row["Metadata"]["request_id"] for row in rows}) == len(rows),
                 "cooled_destination_accepted": evidence.get("return_context_seen", False) and
                     record.get("gpu_migration_from_pci") == target and record.get("gpu_migration_to_pci") == source and
                     record.get("cuda_device_ordinal") == str(source_ordinal) and

@@ -310,6 +310,17 @@ On Windows, each probe joins a Job Object before it initializes CUDA. The job
 ends the probe when Monolith exits. The test verifies that the retry exits
 and that the dedicated VRAM of both processes returns to 0 B.
 
+On Linux, run the SIGKILL regression with an RTX 4000 and T1000, a Linux
+Native AOT publication, Python with pidfd support, and NVIDIA per-process
+VRAM accounting. Run the test in the PID namespace reported by NVML.
+It verifies the retry owns allocations on both GPUs before sending SIGKILL
+to Monolith and checks process exit and VRAM release afterward.
+
+```sh
+cc -std=c11 -shared -fPIC tests/fixtures/cuda-probe-fault-linux.c -o libcuda-probe-fault.so -ldl
+python3 tests/native-aot-admission-vram-linux.py <published-exe> <model-assets-directory> <report-directory> ./libcuda-probe-fault.so
+```
+
 After a failed startup probe, Monolith waits five seconds between attempts.
 Each attempt has a 15-second timeout. Until a complete CUDA inventory is
 available, local inference returns HTTP 503 with `cuda_device_unavailable`.
@@ -366,11 +377,12 @@ python tests/native-aot-thermal-cancel.py <published-exe> <openllama-gguf> <repo
 
 The test checks the NVML temperature used to reject device 0 and verifies
 that the first request releases its KV allocations and SSD swap. While device 1
-is still above 77 °C and device 0 remains in the rejection band, a second request
-to the same model ID must receive HTTP 503 during admission, before the resource
-gate and KV allocation. After device 0 cools to 62 °C or below, a third request
-to that model ID must migrate and finish in the same process. Its output, finish
-reason, and prefill and forward counts must match an isolated run on device 0.
+is still above 77 °C and device 0 remains in the rejection band, the test sends
+three concurrent requests to the same model ID. Each must receive HTTP 503
+during admission, before the resource gate and KV allocation. After device 0
+cools to 62 °C or below, a subsequent request to that model ID must migrate and
+finish in the same process. Its output, finish reason, and prefill and forward
+counts must match an isolated run on device 0.
 
 ## Retrieval-Augmented Generation
 
