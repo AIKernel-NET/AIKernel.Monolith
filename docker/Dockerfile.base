@@ -5,6 +5,7 @@ COPY . .
 COPY --from=aikernel-providers Directory.Build.props /src/AIKernel.Providers/
 COPY --from=aikernel-providers src/Chat/ChatOpenAIProvider/*.cs src/Chat/ChatOpenAIProvider/*.csproj src/Chat/ChatOpenAIProvider/openai.provider.json /src/AIKernel.Providers/src/Chat/ChatOpenAIProvider/
 COPY --from=aikernel-core Directory.Build.props /src/AIKernel.Core/
+COPY --from=aikernel-core build/CudaNativePackaging.targets /src/AIKernel.Core/build/
 COPY --from=aikernel-core src/AIKernel.Common /src/AIKernel.Core/src/AIKernel.Common
 COPY --from=aikernel-core src/AIKernel.Core /src/AIKernel.Core/src/AIKernel.Core
 COPY --from=aikernel-core src/AIKernel.Kernel /src/AIKernel.Core/src/AIKernel.Kernel

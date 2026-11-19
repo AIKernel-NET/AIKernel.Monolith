@@ -16,6 +16,8 @@
     <AIKernelKernelProject Condition="'$(AIKernelKernelProject)' == ''">$(MSBuildThisFileDirectory)../../../AIKernel.Core/src/AIKernel.Kernel/AIKernel.Kernel.csproj</AIKernelKernelProject>
     <ChatOpenAIProviderProject Condition="'$(ChatOpenAIProviderProject)' == ''">$(MSBuildThisFileDirectory)../../../AIKernel.Providers/src/Chat/ChatOpenAIProvider/ChatOpenAIProvider.csproj</ChatOpenAIProviderProject>
     <PublishAot Condition="'$(PublishAot)' == '' and Exists('$(ChatOpenAIProviderProject)')">true</PublishAot>
+    <!-- A solution invoked from outside this checkout can select an older .NET 10 SDK. -->
+    <RuntimeFrameworkVersion Condition="'$(PublishAot)' == 'true' and '$(RuntimeFrameworkVersion)' == '' and '$(BundledNETCoreAppTargetFrameworkVersion)' == '10.0' and $([MSBuild]::VersionLessThan('$(BundledNETCoreAppPackageVersion)', '10.0.15'))">10.0.15</RuntimeFrameworkVersion>
     <InvariantGlobalization>true</InvariantGlobalization>
     <Description>Official AIKernel.Monolith Semantic OS distribution host.</Description>
   </PropertyGroup>
