@@ -59,6 +59,7 @@ public sealed class GovernedInferenceTests
     [InlineData("vetoed")]
     [InlineData("no-policy")]
     [InlineData("cpu-no-policy")]
+    [InlineData("cosmos-no-policy")]
     public async Task CorePolicyDenialPreventsTheProviderCall(string model)
     {
         await using var host = new InferenceHost();
@@ -105,6 +106,8 @@ public sealed class GovernedInferenceTests
             AuditPath = Path.Combine(config, "inference-audit.jsonl");
             File.WriteAllText(Path.Combine(models, "models.json"), """
                 [
+                  { "id": "cosmos-no-policy", "provider":"providers.cosmos-cpu", "model":"cosmos3-edge",
+                    "cosmos":{"directory":"edge","manifestSha256":"0000000000000000000000000000000000000000000000000000000000000000"} },
                   { "id": "cpu-no-policy", "provider":"providers.gguf-cpu", "model":"qwen3",
                     "gguf":{"checkpoint":"not-installed.gguf"} },
                   {

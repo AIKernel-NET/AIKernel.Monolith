@@ -6,6 +6,7 @@ using AIKernel.Monolith.OpenAI;
 namespace AIKernel.Monolith.Internal;
 
 [JsonSerializable(typeof(ModelRegistration))]
+[JsonSerializable(typeof(ChatApiRequest))]
 [JsonSerializable(typeof(ModelAdmissionStatus))]
 [JsonSerializable(typeof(string[]), TypeInfoPropertyName = "CudaPciBusIds")]
 [JsonSerializable(typeof(AuditEvent))]

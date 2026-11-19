@@ -34,7 +34,7 @@ internal sealed class GovernedModelInference(
     {
         var id = CreateCompletionId();
         return RunAsync<ModelCompletion>(modelId, requestId, operation, "chat",
-            ValidateMessages(messages), id, async (provider, token) =>
+            ValidateMessages(modelId,messages), id, async (provider, token) =>
             {
                 var text = await provider.GenerateAsync(messages!, token);
                 return string.IsNullOrEmpty(text) ? null : new ModelCompletion(id, text);
@@ -61,14 +61,15 @@ internal sealed class GovernedModelInference(
         Func<string, Task> onChunk,
         CancellationToken cancellationToken)
         => RunAsync<string>(modelId, requestId, operation, "chat",
-            ValidateMessages(messages), completionId,
+            ValidateMessages(modelId,messages), completionId,
             async (provider, token) => await provider.StreamCompletionAsync(messages!, onChunk, token),
             cancellationToken, async (settings, metadata, token) =>
                 await GenerateLocalAsync(settings, messages!, onChunk, metadata, token));
 
     private Task<Result<string>> GenerateLocalAsync(RegisteredModel model, IReadOnlyList<ChatMessage> messages,
         Func<string,Task> onChunk, Dictionary<string,string> metadata, CancellationToken token)
-        => model.Gguf is { } settings ? ggufModels.GenerateAsync(settings,messages,onChunk,metadata,token)
+        => model.Cosmos is { } cosmos ? ggufModels.GenerateCosmosAsync(cosmos,messages,onChunk,metadata,token)
+            : model.Gguf is { } settings ? ggufModels.GenerateAsync(settings,messages,onChunk,metadata,token)
             : localModels.GenerateAsync(model.Metadata.Id,model.Local!,messages,onChunk,metadata,token);
 
     internal Task<InferenceOutcome<IReadOnlyList<float[]>>> EmbedAsync(
@@ -98,9 +99,10 @@ internal sealed class GovernedModelInference(
             decision.DecisionKind);
     }
 
-    private static InferenceError? ValidateMessages(IReadOnlyList<ChatMessage>? messages)
+    private InferenceError? ValidateMessages(string? modelId,IReadOnlyList<ChatMessage>? messages)
         => messages is { Count: > 0 } && messages.All(message => message is
-            { Role: "system" or "developer" or "user" or "assistant", Content: not null })
+            { Role: "system" or "developer" or "user" or "assistant", Content: not null }) &&
+            (!messages.Any(m => m.Parts.ValueKind == JsonValueKind.Array) || modelId is not null && registry.Find(modelId)?.Cosmos is not null)
             ? null
             : InferenceErrors.InvalidRequest;
 
@@ -166,7 +168,7 @@ internal sealed class GovernedModelInference(
         {
             cancellationToken.ThrowIfCancellationRequested();
             T? value;
-            if (model.Local is not null || model.Gguf is not null)
+            if (model.Local is not null || model.Gguf is not null || model.Cosmos is not null)
             {
                 if (model.Local is not null && topology.Snapshot.PciBusIds is null)
                     return await RejectAsync(InferenceErrors.CudaDeviceUnavailable);
@@ -236,6 +238,7 @@ internal sealed class GovernedModelInference(
                 {
                     "unsupported_model_format" => InferenceErrors.UnsupportedLocalModel,
                     "local_memory_exhausted" => InferenceErrors.LocalMemoryExhausted,
+                    "checkpoint_unavailable" => new InferenceError(503,reason,"The configured checkpoint is unavailable."),
                     "resource_budget_exceeded" or "resource_pcie_budget_exceeded" or "device_queue_full" or
                     "device_temperature_exceeded" or "device_thermal_migration_unavailable" or "device_power_throttled" or
                     "device_telemetry_unavailable" or "device_thermal_migration_failed"

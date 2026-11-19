@@ -125,6 +125,22 @@ On 2026-11-19 a CPU-only Linux host admitted a Bonsai 1.7B request with an empty
 
 Use `GET /v1/models/admission?model=bonsai-local` to check the policy and checkpoint availability. Tensor validation takes place on first generation. The request and audit routes are shared with the other providers.
 
+For a Cosmos 3 conversation, use `provider: "providers.cosmos-cpu"` and
+`model: "cosmos3-edge"` or `"cosmos3-nano"`. In the registration's `cosmos`
+object, set `directory` to a checkpoint directory inside the model mount and
+`manifestSha256` to the trusted import manifest digest. Configure the same
+governance policy as for other local models. The default `weightAccess` is
+`"paged"`. A workstation with sufficient RAM can use `"mapped"`. Both modes
+verify the checkpoint on load. Admission checks metadata and shard presence.
+
+Send alternating user and assistant messages to `/v1/chat/completions`,
+optionally preceded by one system or developer message. User content accepts
+plain text or an array of text, `image_rgb24`, and `video_rgb24` parts.
+An image carries integer width and height (multiples of 32) and base64 RGB
+in row-major order. A video carries an ordered frames array whose entries
+have the same fields plus seconds. Include earlier attachments when sending a
+follow-up. The host currently emits the completed reply in one content chunk.
+
 Register a `providers.paged-llama` chat model under the model mount. This
 provider accepts Llama GGUF v2/v3, Llama SafeTensors with a config.json, and
 legacy llama2.c FP32 checkpoints. GGUF and SafeTensors tensors are mapped

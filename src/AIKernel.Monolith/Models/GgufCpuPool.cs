@@ -10,6 +10,7 @@ internal sealed class GgufCpuPool : IDisposable
 {
     private readonly SemaphoreSlim lease = new(1);
     private GgufCpuSettings? current;
+    private CosmosCpuSettings? currentCosmos;
     private IDisposable? model;
     private Func<string,string,int,CancellationToken,Task<CpuGeneration>>? generate;
     private bool disposed;
@@ -30,7 +31,7 @@ internal sealed class GgufCpuPool : IDisposable
             if (current != settings)
             {
                 model?.Dispose();
-                current=null; model=null; generate=null;
+                current=null; currentCosmos=null; model=null; generate=null;
                 switch (settings.Architecture)
                 {
                     case "qwen3":
@@ -63,7 +64,45 @@ internal sealed class GgufCpuPool : IDisposable
         finally { lease.Release(); }
     }
 
-    private static Result<string> Failure(string code) => Result<string>.Fail(new ErrorContext("CPU GGUF inference failed.",code,false));
+    internal async Task<Result<string>> GenerateCosmosAsync(CosmosCpuSettings settings,IReadOnlyList<ChatMessage> messages,
+        Func<string,Task> onChunk,Dictionary<string,string> metadata,CancellationToken token)
+    {
+        await lease.WaitAsync(token);
+        try
+        {
+            ObjectDisposedException.ThrowIf(disposed,this);
+            using var input = new CosmosChatInput();
+            if (!input.Read(messages,settings.Architecture)) return Failure("invalid_messages");
+            if (currentCosmos!=settings)
+            {
+                model?.Dispose(); model=null; generate=null; current=null; currentCosmos=null;
+                if (!CosmosChatInput.HasCheckpoint(settings)) return Failure("checkpoint_unavailable");
+                var variant=settings.Architecture=="cosmos3-edge"?Cosmos3Variant.Edge:Cosmos3Variant.Nano;
+                model=new Cosmos3Model(settings.Directory,variant,new CosmosExecutionOptions {
+                    CpuThreads=settings.Threads,ContextTokens=settings.Context,EnableThinking=false,
+                    ExpectedImportManifestSha256=settings.ManifestSha256,
+                    Memory=settings.WeightAccess=="paged" ? new CosmosMemoryOptions {SwapDirectory=settings.SwapDirectory} : null
+                });
+                currentCosmos=settings;
+            }
+            CosmosGeneration reply;
+            try { reply=await ((Cosmos3Model)model!).GenerateChatAsync(input.System,input.History,input.User,settings.MaxNewTokens,token); }
+            catch (ArgumentException) { return Failure("context_length_exceeded"); }
+            token.ThrowIfCancellationRequested();
+            metadata["backend"]="cpu";
+            metadata["model_manifest_sha256"]=reply.Artifact!.ManifestSha256;
+            metadata["input_tokens"]=reply.InputTokens.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (reply.Text.Length>0) await onChunk(reply.Text);
+            return Result<string>.Success(reply.FinishReason);
+        }
+        catch (InvalidDataException) { return Failure("unsupported_model_format"); }
+        catch (NotSupportedException) { return Failure("unsupported_model_format"); }
+        catch (IOException) { return Failure("checkpoint_unavailable"); }
+        catch (OutOfMemoryException) { return Failure("local_memory_exhausted"); }
+        finally { lease.Release(); }
+    }
+
+    private static Result<string> Failure(string code) => Result<string>.Fail(new ErrorContext("Local CPU inference failed.",code,false));
     public void Dispose()
     {
         lease.Wait();

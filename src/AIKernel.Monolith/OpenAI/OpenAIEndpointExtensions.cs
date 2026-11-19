@@ -56,16 +56,17 @@ public static class OpenAIEndpointExtensions
                 MonolithJsonContext.Default.CompletionResponse);
         });
 
-        endpoints.MapPost("/v1/chat/completions", async (ChatCompletionRequest request, HttpContext context,
+        endpoints.MapPost("/v1/chat/completions", async (ChatApiRequest request, HttpContext context,
             GovernedModelInference inference, CancellationToken cancellationToken) =>
         {
+            var messages = request.ReadMessages();
             if (request.Stream == true)
             {
-                return await StreamAsync(request.Model, request.Messages, context, inference,
+                return await StreamAsync(request.Model, messages, context, inference,
                     "chat.completions", chat: true, cancellationToken);
             }
 
-            var outcome = await inference.CompleteAsync(request.Model, request.Messages,
+            var outcome = await inference.CompleteAsync(request.Model, messages,
                 context.TraceIdentifier, "chat.completions", cancellationToken);
             if (outcome.Error is { } error)
             {

@@ -19,6 +19,7 @@ public sealed class ModelProviderRegistry
     private const string ChatOpenAIProviderId = "providers.openai";
     private const string PagedLlamaProviderId = "providers.paged-llama";
     private const string GgufProviderId = "providers.gguf-cpu";
+    private const string CosmosProviderId = "providers.cosmos-cpu";
     private readonly Dictionary<string, RegisteredModel> models = new(StringComparer.Ordinal);
 
     public ModelProviderRegistry(MountOptions mountOptions)
@@ -39,14 +40,17 @@ public sealed class ModelProviderRegistry
                 if (candidate.ValueKind != JsonValueKind.Object ||
                     !candidate.TryGetProperty("provider", out var provider) ||
                     provider.ValueKind != JsonValueKind.String ||
-                    provider.GetString() is not (ChatOpenAIProviderId or PagedLlamaProviderId or GgufProviderId))
+                    provider.GetString() is not (ChatOpenAIProviderId or PagedLlamaProviderId or GgufProviderId or CosmosProviderId))
                 {
                     continue;
                 }
 
                 var registration = candidate.Deserialize(InferenceJsonContext.Default.ModelRegistration)!;
+                if (registration.Provider != CosmosProviderId && registration.Cosmos is not null)
+                    throw new InvalidDataException($"Unexpected Cosmos settings in '{path}'.");
                 var model = registration.Provider switch
                 {
+                    CosmosProviderId => CreateCosmos(registration, mountOptions, path),
                     GgufProviderId => CreateGguf(registration, mountOptions, path),
                     PagedLlamaProviderId => CreateLocalModel(registration, mountOptions, path),
                     _ => CreateModel(registration, path)
@@ -98,6 +102,22 @@ public sealed class ModelProviderRegistry
     internal bool HasPagedLlamaModels => models.Values.Any(model => model.Local is not null);
 
     internal RegisteredModel? Find(string id) => models.GetValueOrDefault(id);
+
+    private static RegisteredModel CreateCosmos(ModelRegistration registration, MountOptions mounts, string path)
+    {
+        var c=registration.Cosmos;
+        if (string.IsNullOrWhiteSpace(registration.Id) || registration.Kind is not (null or "chat")
+            || registration.Endpoint is not null || registration.ApiKeyEnvironmentVariable is not null
+            || registration.Local is not null || registration.Gguf is not null || c is null
+            || registration.Model is not ("cosmos3-edge" or "cosmos3-nano")
+            || c.ManifestSha256 is not { Length:64 } || !c.ManifestSha256.All(Uri.IsHexDigit)
+            || c.WeightAccess is not ("paged" or "mapped") || c.CpuThreads is <1 or >6 || c.ContextTokens is <32 or >2048
+            || c.MaxNewTokens is <1 or >256 || c.MaxNewTokens >= c.ContextTokens)
+            throw new InvalidDataException($"Invalid Cosmos registration in '{path}'.");
+        var settings = new CosmosCpuSettings(ResolveAsset(mounts.ModelRoot,c.Directory,path),registration.Model,
+            c.ManifestSha256,c.WeightAccess,c.CpuThreads,c.ContextTokens,c.MaxNewTokens,Path.Combine(mounts.ConfigRoot,"model-swap"));
+        return new(new(registration.Id,CosmosProviderId,"chat"),null,null,ReadPolicy(registration.Policy),Cosmos:settings);
+    }
 
     private static RegisteredModel CreateGguf(ModelRegistration registration, MountOptions mounts, string path)
     {
@@ -248,7 +268,7 @@ internal sealed record RegisteredModel(
     ChatOpenAISettings? Settings,
     string? ApiKeyEnvironmentVariable,
     GateInput Policy,
-    PagedLlamaSettings? Local = null, GgufCpuSettings? Gguf = null);
+    PagedLlamaSettings? Local = null, GgufCpuSettings? Gguf = null, CosmosCpuSettings? Cosmos = null);
 
 internal sealed record ModelRegistration(
     [property: JsonPropertyName("id")] string? Id,
@@ -259,7 +279,19 @@ internal sealed record ModelRegistration(
     [property: JsonPropertyName("apiKeyEnvironmentVariable")] string? ApiKeyEnvironmentVariable,
     [property: JsonPropertyName("policy")] ModelPolicy? Policy,
     [property: JsonPropertyName("local")] PagedLlamaRegistration? Local,
-    [property: JsonPropertyName("gguf")] GgufCpuRegistration? Gguf = null);
+    [property: JsonPropertyName("gguf")] GgufCpuRegistration? Gguf = null,
+    [property: JsonPropertyName("cosmos")] CosmosCpuRegistration? Cosmos = null);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+internal sealed record CosmosCpuRegistration(
+    [property: JsonPropertyName("directory")] string Directory,
+    [property: JsonPropertyName("manifestSha256")] string ManifestSha256,
+    [property: JsonPropertyName("weightAccess")] string WeightAccess="paged",
+    [property: JsonPropertyName("cpuThreads")] int CpuThreads=4,
+    [property: JsonPropertyName("contextTokens")] int ContextTokens=512,
+    [property: JsonPropertyName("maxNewTokens")] int MaxNewTokens=32);
+
+internal sealed record CosmosCpuSettings(string Directory,string Architecture,string ManifestSha256,string WeightAccess,int Threads,int Context,int MaxNewTokens,string SwapDirectory);
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 internal sealed record GgufCpuRegistration(

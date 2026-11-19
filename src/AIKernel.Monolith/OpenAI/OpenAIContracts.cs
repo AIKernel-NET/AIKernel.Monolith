@@ -20,7 +20,34 @@ public sealed record ChatCompletionRequest(
 /// </summary>
 public sealed record ChatMessage(
     [property: JsonPropertyName("role")] string Role,
-    [property: JsonPropertyName("content")] string Content) : AIKernel.Abstractions.Providers.IModelMessage;
+    [property: JsonPropertyName("content")] string Content) : AIKernel.Abstractions.Providers.IModelMessage
+{
+    internal JsonElement Parts { get; init; }
+}
+
+internal sealed record ChatApiMessage([property: JsonPropertyName("role")] string? Role,
+    [property: JsonPropertyName("content")] JsonElement Content);
+internal sealed record ChatApiRequest([property: JsonPropertyName("model")] string Model,
+    [property: JsonPropertyName("messages")] ChatApiMessage?[]? Messages,
+    [property: JsonPropertyName("stream")] bool? Stream = null)
+{
+    internal ChatMessage[]? ReadMessages()
+    {
+        if (Messages is not { Length: > 0 and <= 256 }) return null;
+        var result = new ChatMessage[Messages.Length];
+        for (int i=0; i<result.Length; i++)
+        {
+            var message = Messages[i];
+            if (message?.Role is null) return null;
+            if (message.Content.ValueKind == JsonValueKind.String)
+                result[i] = new(message.Role,message.Content.GetString()!);
+            else if (message.Role == "user" && message.Content.ValueKind == JsonValueKind.Array)
+                result[i] = new(message.Role,"") { Parts=message.Content };
+            else return null;
+        }
+        return result;
+    }
+}
 
 /// <summary>
 /// EN: OpenAI-compatible completion request. JA: OpenAI 互換 completion request です。
