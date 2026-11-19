@@ -185,5 +185,5 @@ internal sealed record CudaTopologySnapshot(string?[]? PciBusIds, bool IsProbing
 internal sealed class CudaTopologyRetryService(CudaTopology topology, ModelProviderRegistry registry) : BackgroundService
 {
     protected override Task ExecuteAsync(CancellationToken stoppingToken)
-        => registry.HasLocalModels ? topology.RetryUntilAvailableAsync(stoppingToken) : Task.CompletedTask;
+        => registry.HasPagedLlamaModels ? topology.RetryUntilAvailableAsync(stoppingToken) : Task.CompletedTask;
 }

@@ -58,6 +58,7 @@ public sealed class GovernedInferenceTests
     [Theory]
     [InlineData("vetoed")]
     [InlineData("no-policy")]
+    [InlineData("cpu-no-policy")]
     public async Task CorePolicyDenialPreventsTheProviderCall(string model)
     {
         await using var host = new InferenceHost();
@@ -104,6 +105,8 @@ public sealed class GovernedInferenceTests
             AuditPath = Path.Combine(config, "inference-audit.jsonl");
             File.WriteAllText(Path.Combine(models, "models.json"), """
                 [
+                  { "id": "cpu-no-policy", "provider":"providers.gguf-cpu", "model":"qwen3",
+                    "gguf":{"checkpoint":"not-installed.gguf"} },
                   {
                     "id": "first", "provider": "providers.openai",
                     "endpoint": "https://first.example/v1/",

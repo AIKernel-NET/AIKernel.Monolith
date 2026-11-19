@@ -18,6 +18,7 @@ public sealed class ModelProviderRegistry
 {
     private const string ChatOpenAIProviderId = "providers.openai";
     private const string PagedLlamaProviderId = "providers.paged-llama";
+    private const string GgufProviderId = "providers.gguf-cpu";
     private readonly Dictionary<string, RegisteredModel> models = new(StringComparer.Ordinal);
 
     public ModelProviderRegistry(MountOptions mountOptions)
@@ -38,15 +39,18 @@ public sealed class ModelProviderRegistry
                 if (candidate.ValueKind != JsonValueKind.Object ||
                     !candidate.TryGetProperty("provider", out var provider) ||
                     provider.ValueKind != JsonValueKind.String ||
-                    provider.GetString() is not (ChatOpenAIProviderId or PagedLlamaProviderId))
+                    provider.GetString() is not (ChatOpenAIProviderId or PagedLlamaProviderId or GgufProviderId))
                 {
                     continue;
                 }
 
                 var registration = candidate.Deserialize(InferenceJsonContext.Default.ModelRegistration)!;
-                var model = registration.Provider == PagedLlamaProviderId
-                    ? CreateLocalModel(registration, mountOptions, path)
-                    : CreateModel(registration, path);
+                var model = registration.Provider switch
+                {
+                    GgufProviderId => CreateGguf(registration, mountOptions, path),
+                    PagedLlamaProviderId => CreateLocalModel(registration, mountOptions, path),
+                    _ => CreateModel(registration, path)
+                };
                 if (!models.TryAdd(model.Metadata.Id, model))
                 {
                     throw new InvalidDataException($"Duplicate model ID '{model.Metadata.Id}' in '{path}'.");
@@ -91,9 +95,24 @@ public sealed class ModelProviderRegistry
     public IReadOnlyList<ModelMetadata> ListModels()
         => models.Values.Select(x => x.Metadata).OrderBy(x => x.Id, StringComparer.Ordinal).ToArray();
 
-    internal bool HasLocalModels => models.Values.Any(model => model.Local is not null);
+    internal bool HasPagedLlamaModels => models.Values.Any(model => model.Local is not null);
 
     internal RegisteredModel? Find(string id) => models.GetValueOrDefault(id);
+
+    private static RegisteredModel CreateGguf(ModelRegistration registration, MountOptions mounts, string path)
+    {
+        var config = registration.Gguf;
+        int threads = config?.CpuThreads ?? 4, context = config?.ContextTokens ?? 512;
+        int maximum = config?.MaxNewTokens ?? Math.Min(128,context-1);
+        if (string.IsNullOrWhiteSpace(registration.Id) || registration.Kind is not (null or "chat") ||
+            registration.Model is not ("qwen3" or "gemma4-e2b" or "gpt-oss-20b") || config is null ||
+            registration.Endpoint is not null || registration.ApiKeyEnvironmentVariable is not null || registration.Local is not null ||
+            threads is <1 or >6 || context is <64 or >2048 || maximum is <1 or >256 || maximum >= context)
+            throw new InvalidDataException($"Invalid CPU GGUF registration in '{path}'.");
+        var settings = new GgufCpuSettings(registration.Model, ResolveAsset(mounts.ModelRoot,config.Checkpoint,path),
+            threads,context,maximum,Path.Combine(mounts.ConfigRoot,"model-swap"));
+        return new(new(registration.Id,GgufProviderId,"chat"),null,null,ReadPolicy(registration.Policy),Gguf:settings);
+    }
 
     private static RegisteredModel CreateModel(ModelRegistration registration, string path)
     {
@@ -229,7 +248,7 @@ internal sealed record RegisteredModel(
     ChatOpenAISettings? Settings,
     string? ApiKeyEnvironmentVariable,
     GateInput Policy,
-    PagedLlamaSettings? Local = null);
+    PagedLlamaSettings? Local = null, GgufCpuSettings? Gguf = null);
 
 internal sealed record ModelRegistration(
     [property: JsonPropertyName("id")] string? Id,
@@ -239,7 +258,17 @@ internal sealed record ModelRegistration(
     [property: JsonPropertyName("model")] string? Model,
     [property: JsonPropertyName("apiKeyEnvironmentVariable")] string? ApiKeyEnvironmentVariable,
     [property: JsonPropertyName("policy")] ModelPolicy? Policy,
-    [property: JsonPropertyName("local")] PagedLlamaRegistration? Local);
+    [property: JsonPropertyName("local")] PagedLlamaRegistration? Local,
+    [property: JsonPropertyName("gguf")] GgufCpuRegistration? Gguf = null);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+internal sealed record GgufCpuRegistration(
+    [property: JsonPropertyName("checkpoint")] string? Checkpoint,
+    [property: JsonPropertyName("cpuThreads")] int? CpuThreads,
+    [property: JsonPropertyName("contextTokens")] int? ContextTokens,
+    [property: JsonPropertyName("maxNewTokens")] int? MaxNewTokens);
+
+internal sealed record GgufCpuSettings(string Architecture,string Checkpoint,int Threads,int Context,int MaxNewTokens,string SwapDirectory);
 
 internal sealed record ModelPolicy(
     [property: JsonPropertyName("logos")] string? Logos,

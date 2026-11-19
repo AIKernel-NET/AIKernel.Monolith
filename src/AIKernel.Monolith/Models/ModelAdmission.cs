@@ -16,6 +16,7 @@ internal sealed class ModelAdmission(IDecisionGate gate, PagedLlamaPool localMod
         var inventory = model.Local is null ? null : topology.Snapshot;
         (string backend, int? device, int? admissionDevice, string? reason, GpuAdmissionStatus[] devices) = model.Local is { } settings
             ? ReadLocal(settings, localModels.GetPlacement(model.Metadata.Id), inventory!.PciBusIds, token)
+            : model.Gguf is { } cpu ? ("cpu",null,null,File.Exists(cpu.Checkpoint)?null:"checkpoint_unavailable",Array.Empty<GpuAdmissionStatus>())
             : ("external", null, null, CredentialError(model), Array.Empty<GpuAdmissionStatus>());
         if (!policyAllowed)
             reason = InferenceErrors.PolicyDenied.Code;

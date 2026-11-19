@@ -19,6 +19,7 @@ internal sealed class GovernedModelInference(
     IAuditEventWriter audit,
     IHttpClientFactory clients,
     PagedLlamaPool localModels,
+    GgufCpuPool ggufModels,
     CudaTopology topology,
     ILogger<GovernedModelInference> logger)
 {
@@ -40,7 +41,7 @@ internal sealed class GovernedModelInference(
             }, cancellationToken, async (settings, metadata, token) =>
             {
                 var text = new StringBuilder();
-                var result = await localModels.GenerateAsync(modelId!, settings, messages!, chunk =>
+                var result = await GenerateLocalAsync(settings, messages!, chunk =>
                 {
                     text.Append(chunk);
                     return Task.CompletedTask;
@@ -63,7 +64,12 @@ internal sealed class GovernedModelInference(
             ValidateMessages(messages), completionId,
             async (provider, token) => await provider.StreamCompletionAsync(messages!, onChunk, token),
             cancellationToken, async (settings, metadata, token) =>
-                await localModels.GenerateAsync(modelId!, settings, messages!, onChunk, metadata, token));
+                await GenerateLocalAsync(settings, messages!, onChunk, metadata, token));
+
+    private Task<Result<string>> GenerateLocalAsync(RegisteredModel model, IReadOnlyList<ChatMessage> messages,
+        Func<string,Task> onChunk, Dictionary<string,string> metadata, CancellationToken token)
+        => model.Gguf is { } settings ? ggufModels.GenerateAsync(settings,messages,onChunk,metadata,token)
+            : localModels.GenerateAsync(model.Metadata.Id,model.Local!,messages,onChunk,metadata,token);
 
     internal Task<InferenceOutcome<IReadOnlyList<float[]>>> EmbedAsync(
         string? modelId,
@@ -107,7 +113,7 @@ internal sealed class GovernedModelInference(
         string? completionId,
         Func<ChatOpenAIProvider, CancellationToken, Task<T?>> execute,
         CancellationToken cancellationToken,
-        Func<PagedLlamaSettings, Dictionary<string, string>, CancellationToken, Task<Result<T>>>? executeLocal = null) where T : class
+        Func<RegisteredModel, Dictionary<string, string>, CancellationToken, Task<Result<T>>>? executeLocal = null) where T : class
     {
         var model = modelId is null ? null : registry.Find(modelId);
         var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -160,15 +166,16 @@ internal sealed class GovernedModelInference(
         {
             cancellationToken.ThrowIfCancellationRequested();
             T? value;
-            if (model.Local is { } local)
+            if (model.Local is not null || model.Gguf is not null)
             {
-                if (topology.Snapshot.PciBusIds is null)
+                if (model.Local is not null && topology.Snapshot.PciBusIds is null)
                     return await RejectAsync(InferenceErrors.CudaDeviceUnavailable);
 
-                var result = await executeLocal!(local, metadata, cancellationToken);
+                var result = await executeLocal!(model, metadata, cancellationToken);
                 if (result.IsFailure)
                 {
                     var error = result.Error!;
+                    if (error.Code == "invalid_messages") return await RejectAsync(InferenceErrors.InvalidRequest);
                     if (error.Code == "context_length_exceeded")
                         return await RejectAsync(InferenceErrors.ContextLengthExceeded);
 

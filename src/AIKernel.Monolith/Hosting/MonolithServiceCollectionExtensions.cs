@@ -33,6 +33,7 @@ public static class MonolithServiceCollectionExtensions
         services.AddSingleton<IDecisionGate>(_ => new CtgDecisionGateEvaluator());
         services.AddSingleton<IAuditEventWriter, FileInferenceAuditWriter>();
         services.AddSingleton<PagedLlamaPool>();
+        services.AddSingleton<GgufCpuPool>();
         services.AddSingleton<GovernedModelInference>();
         services.AddSingleton<CudaTopology>();
         services.AddHostedService<CudaTopologyRetryService>();

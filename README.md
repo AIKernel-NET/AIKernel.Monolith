@@ -111,6 +111,20 @@ completion requests, and an embedding registration only accepts embedding reques
 
 ### Local paged CUDA inference
 
+For CPU inference, place the checkpoint and a registration under the model mount. The `providers.gguf-cpu` provider accepts `qwen3` (Bonsai), `gemma4-e2b`, and `gpt-oss-20b`. It accepts one user message with an optional preceding system or developer message. The streaming endpoint emits the completed answer as one content chunk. A single active model serves requests in sequence. Gemma uses AIKernel's CPU weight paging. GPT-OSS requires a host sized for its 12.1 GB checkpoint and runtime.
+
+On 2026-11-19 a CPU-only Linux host admitted a Bonsai 1.7B request with an empty GPU inventory and returned `4` for a local arithmetic question through `/v1/chat/completions`. Peak process RSS was 405,614,592 bytes with two CPUs in its affinity mask. The Windows x64 NativeAOT executable returned the same answer through authenticated HTTP.
+
+```json
+{
+  "id": "bonsai-local", "provider": "providers.gguf-cpu", "model": "qwen3",
+  "gguf": { "checkpoint": "Bonsai-1.7B-Q1_0.gguf", "cpuThreads": 4, "contextTokens": 512, "maxNewTokens": 96 },
+  "policy": { "logos": "approve", "ethos": "approve", "pathos": "abstain" }
+}
+```
+
+Use `GET /v1/models/admission?model=bonsai-local` to check the policy and checkpoint availability. Tensor validation takes place on first generation. The request and audit routes are shared with the other providers.
+
 Register a `providers.paged-llama` chat model under the model mount. This
 provider accepts Llama GGUF v2/v3, Llama SafeTensors with a config.json, and
 legacy llama2.c FP32 checkpoints. GGUF and SafeTensors tensors are mapped

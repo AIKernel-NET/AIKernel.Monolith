@@ -46,7 +46,7 @@ builder.Services.AddAIKernelMonolith(mountOptions);
 
 var app = builder.Build();
 var registry = app.Services.GetRequiredService<ModelProviderRegistry>();
-if (registry.HasLocalModels)
+if (registry.HasPagedLlamaModels)
     await app.Services.GetRequiredService<CudaTopology>().InitializeAsync();
 app.Use(apiAccess.InvokeAsync);
 
