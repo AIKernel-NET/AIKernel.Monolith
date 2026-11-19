@@ -1,4 +1,4 @@
-"""Verify access control on a published Windows x64 Native AOT Monolith."""
+"""Verify access control on a published Windows or Linux x64 Native AOT Monolith."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from http.client import HTTPConnection
@@ -69,7 +69,7 @@ def smoke(exe, output):
             else:
                 invalid[name] = value
             result = subprocess.run(command, cwd=work, env=invalid, capture_output=True, text=True,
-                                    timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
+                                    timeout=15, creationflags=helpers["PROCESS_FLAGS"])
             assert result.returncode == 2 and name in result.stderr, (name, result.stderr)
 
         class Upstream(BaseHTTPRequestHandler):
@@ -98,7 +98,7 @@ def smoke(exe, output):
             thread.start()
             with log.open("wb") as output_stream:
                 process = subprocess.Popen(command, cwd=work, env=env, stdout=output_stream,
-                                           stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
+                                           stderr=subprocess.STDOUT, creationflags=helpers["PROCESS_FLAGS"])
                 try:
                     port = helpers["wait_for_port"](process, log)
                     chat = "/v1/chat/completions"

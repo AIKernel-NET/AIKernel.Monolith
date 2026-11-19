@@ -1,4 +1,4 @@
-"""Exercise a published Windows x64 Native AOT Monolith against a loopback provider."""
+"""Exercise a published Windows or Linux x64 Native AOT Monolith against a loopback provider."""
 from contextlib import closing
 import hashlib
 from http.client import HTTPConnection
@@ -17,6 +17,7 @@ import time
 
 
 TEST_API_KEY = "native-stream-test-only-key"
+PROCESS_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def events(response):
@@ -36,6 +37,12 @@ def audit_entries(file):
 
 def native_image(exe):
     image = exe.read_bytes()
+    if sys.platform.startswith("linux"):
+        # ELF64, little endian, x86-64 executable or position-independent executable.
+        assert image[:7] == b"\x7fELF\x02\x01\x01"
+        elf_type, machine = struct.unpack_from("<HH", image, 16)
+        assert elf_type in (2, 3) and machine == 62
+        return hashlib.sha256(image).hexdigest()
     assert image[:2] == b"MZ"
     pe = struct.unpack_from("<I", image, 0x3C)[0]
     assert image[pe:pe + 4] == b"PE\0\0"
@@ -186,7 +193,7 @@ def smoke(exe, output, capability_exe=None):
                 process = subprocess.Popen([str(binary), "--urls=http://127.0.0.1:0",
                                             *[f"--{key}-root={value}" for key, value in roots.items()]],
                                            cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                           creationflags=subprocess.CREATE_NO_WINDOW)
+                                           creationflags=PROCESS_FLAGS)
                 try:
                     port = wait_for_port(process, log_path)
 
@@ -271,7 +278,7 @@ def smoke(exe, output, capability_exe=None):
                     assert sum(row["Description"] == "denied" for row in entries) == 1
                     assert all("upstream unavailable" not in row["Description"] for row in entries)
 
-                    result = {"sha256": digest, "machine": "win-x64", "streamed_before_upstream_finish": released_before_finish,
+                    result = {"sha256": digest, "machine": "linux-x64" if sys.platform.startswith("linux") else "win-x64", "streamed_before_upstream_finish": released_before_finish,
                               "truncated_stream_rejected": True, "embedding_vectors": vectors["data"],
                               "upstream_calls": count, "audit_records": len(entries)}
                     if capability_exe is not None:
@@ -280,7 +287,7 @@ def smoke(exe, output, capability_exe=None):
                         shutil.copy2(capability_exe, capability_copy)
                         probe = subprocess.run([str(capability_copy), f"http://127.0.0.1:{upstream_port}/capability/v1"],
                                                env=env, cwd=work, capture_output=True, text=True, timeout=15,
-                                               creationflags=subprocess.CREATE_NO_WINDOW, check=True)
+                                               creationflags=PROCESS_FLAGS, check=True)
                         vector_json, vector_hash = probe.stdout.splitlines()
                         assert json.loads(vector_json) == [0.125, -0.25]
                         assert vector_hash == "sha256:" + hashlib.sha256(vector_json.encode("utf-8")).hexdigest()
