@@ -41,7 +41,8 @@ internal sealed class GgufCpuPool : IDisposable
                             new() { Memory=new() { SwapDirectory=settings.SwapDirectory } });
                         model=gemma; generate=gemma.GenerateAsync; break;
                     case "gpt-oss-20b":
-                        var gpt=new GptOss20BCpuModel(settings.Checkpoint,settings.Threads,settings.Context);
+                        var gpt=new GptOss20BCpuModel(settings.Checkpoint,settings.Threads,settings.Context,
+                            new GgufMemoryOptions { SwapDirectory=settings.SwapDirectory });
                         model=gpt; generate=gpt.GenerateAsync; break;
                     default: return Failure("unsupported_model_format");
                 }

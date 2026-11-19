@@ -111,7 +111,7 @@ completion requests, and an embedding registration only accepts embedding reques
 
 ### Local paged CUDA inference
 
-For CPU inference, place the checkpoint and a registration under the model mount. The `providers.gguf-cpu` provider accepts `qwen3` (Bonsai), `gemma4-e2b`, and `gpt-oss-20b`. It accepts one user message with an optional preceding system or developer message. The streaming endpoint emits the completed answer as one content chunk. A single active model serves requests in sequence. Gemma uses AIKernel's CPU weight paging. GPT-OSS requires a host sized for its 12.1 GB checkpoint and runtime.
+For CPU inference, place the checkpoint and a registration under the model mount. The `providers.gguf-cpu` provider accepts `qwen3` (Bonsai), `gemma4-e2b`, and `gpt-oss-20b`. It accepts one user message with an optional preceding system or developer message. The streaming endpoint emits the completed answer as one content chunk. A single active model serves requests in sequence. Gemma and GPT-OSS use AIKernel's CPU weight paging. For GPT-OSS-20B, reserve 12.1 GB on disk for the MXFP4 GGUF. The host uses a 5 GB weight cache and checks process residency against a 7 GB budget. Evicted weights can be read again from the original GGUF.
 
 On 2026-11-19 a CPU-only Linux host admitted a Bonsai 1.7B request with an empty GPU inventory and returned `4` for a local arithmetic question through `/v1/chat/completions`. Peak process RSS was 405,614,592 bytes with two CPUs in its affinity mask. The Windows x64 NativeAOT executable returned the same answer through authenticated HTTP.
 
