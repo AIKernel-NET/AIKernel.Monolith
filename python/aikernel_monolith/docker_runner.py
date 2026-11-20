@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import platform
 import subprocess
 from pathlib import Path
 
@@ -10,8 +9,8 @@ from . import constants
 
 
 def select_image() -> str:
-    """Return the platform-specific monolith image."""
-    return constants.WINDOWS_IMAGE if platform.system().lower().startswith("win") else constants.LINUX_IMAGE
+    """Select the Linux x64 image on all supported Docker hosts."""
+    return constants.LINUX_IMAGE
 
 
 def ensure_mounts() -> list[Path]:

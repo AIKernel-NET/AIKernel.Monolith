@@ -1,3 +1,4 @@
+# Compatibility build for Windows hosts running Docker in Linux containers mode.
 FROM aikernel/monolith:base
-ENV AIKERNEL_PLATFORM=windows
-ENV AIKERNEL_NATIVE_ABI=dll
+ENV AIKERNEL_PLATFORM=linux
+ENV AIKERNEL_NATIVE_ABI=so

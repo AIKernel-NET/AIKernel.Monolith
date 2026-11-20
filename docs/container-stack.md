@@ -1,38 +1,12 @@
-# Container Stack
+# Run Monolith in a container
 
-## Overview
+Build the base and Linux images with the commands in the [host README](../README.md#container-stack). The base publishes for `linux-x64` and includes the runtime executable, shell entrypoint and sample files. The Linux image uses the `.so` native ABI.
 
-AIKernel.Monolith uses a base image plus platform-specific images.
+| Environment | How to run Monolith |
+| --- | --- |
+| Linux x64 Docker engine | Build and run `aikernel/monolith:linux`. |
+| Docker Desktop on Windows, Linux containers mode | Use the same Linux x64 image. The legacy `Dockerfile.windows` builds a compatibility tag for this runtime. |
+| Docker Desktop on Windows, Windows containers mode | The project does not publish a native Windows container image. Switch Docker Desktop to Linux containers to use the CLI. |
+| Native Windows x64 process | Run the published `win-x64` executable with the [four mount paths and loopback address](../README.md#run-the-monolith). |
 
-## Sequence Diagram
-
-```text
-Dockerfile.base
-  -> aikernel/monolith:base
-  -> Dockerfile.linux / Dockerfile.windows
-  -> runtime image
-```
-
-## Extension Points
-
-- Add Linux `.so` libraries in the Linux image.
-- Add Windows `.dll` libraries in the Windows image.
-- Keep persistent state outside all images.
-
-## Determinism Guarantees
-
-The base image contains only the AOT binary, entrypoint, and read-only samples.
-
-## External Mount Architecture
-
-Runtime data must be mounted externally. Missing mounts cause startup failure. The runtime writes inference audit events to the external config mount.
-
-## Container Stack Architecture
-
-- `Dockerfile.base`: AOT binary and samples. Pass the sibling AIKernel.Providers and AIKernel.Core checkouts as the `aikernel-providers` and `aikernel-core` build contexts.
-- `Dockerfile.linux`: Linux native ABI layer.
-- `Dockerfile.windows`: Windows native ABI layer.
-
-## Python CLI Workflow
-
-The Python CLI selects the platform image and mounts host directories into the container.
+The [Python CLI](python-cli.md) mounts the host's config, models, VFS and capabilities directories. The host appends inference audit records to the writable config directory. Keep these four directories outside the image so their contents survive a container restart.

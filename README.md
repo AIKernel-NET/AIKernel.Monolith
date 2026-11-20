@@ -10,22 +10,63 @@ AIKernel.Monolith は、AIKernel SDK 上に構築される公式 AIOS ディス�
 src/AIKernel.Monolith/       C# / .NET 10 Minimal API runtime
 python/aikernel_monolith/    Python CLI wrapper package
 tests/                       C# and Python tests
-docker/                      Base, Linux, and Windows container stack
+docker/                      Linux x64 container build and entrypoint
 samples/                     Read-only sample configuration templates
 docs/                        Architecture and operating guides
 ```
 
 ## Run the Monolith
 
-The runtime requires four external mount roots. Inference audit events are appended to the external config mount.
+Use Bash with Git, OpenSSL and the .NET 10 SDK selected by [global.json](global.json) (10.0.404 or a later patch in its feature band). From a common parent directory, clone the three development repositories side by side. If you already have them, start in the Monolith checkout.
 
 ```bash
-dotnet run --project src/AIKernel.Monolith/AIKernel.Monolith.csproj -- \
-  --config-root=/path/to/config \
-  --model-root=/path/to/models \
-  --vfs-root=/path/to/vfs \
-  --capability-root=/path/to/capabilities
+git clone -b dev https://github.com/AIKernel-NET/AIKernel.Core.git
+git clone -b dev https://github.com/AIKernel-NET/AIKernel.Providers.git
+git clone -b dev https://github.com/AIKernel-NET/AIKernel.Monolith.git
+cd AIKernel.Monolith
 ```
+
+For a first Cosmos reply, prepare a Python environment with the [checkpoint import dependencies](https://github.com/AIKernel-NET/AIKernel.Core/blob/dev/docs/cosmos3-inference-en.md). From the Monolith checkout, create a private directory for the four mounts, import Edge once and install the [local registration](samples/cosmos-edge.json).
+
+```bash
+umask 077
+export AIKERNEL_STATE="$HOME/aikernel-local"
+mkdir -p "$AIKERNEL_STATE"/{config,models,vfs,capabilities}
+python ../AIKernel.Core/tools/models/import_cosmos3.py Edge "$AIKERNEL_STATE/models/edge"
+python samples/install_cosmos_edge.py "$AIKERNEL_STATE/models"
+```
+
+The installer checks the known Edge manifest content, accepts either importer line ending and pins the exact digest of the file on disk. It preserves an existing customized registration. Monolith verifies the actual shard hashes on first load.
+
+```text
+aikernel-local/
+  config/                     # private audit log
+  models/cosmos-edge.json     # host registration
+  models/edge/                # import-manifest.json, tokenizer, reasoner-*.safetensors
+  vfs/
+  capabilities/
+```
+
+Start the host in the background so the client commands in the same shell inherit its bearer token. Monolith writes its audit log under the config root.
+
+```bash
+export AIKERNEL_API_KEY="$(openssl rand -hex 32)"
+dotnet run --project src/AIKernel.Monolith/AIKernel.Monolith.csproj -- \
+  --config-root="$AIKERNEL_STATE/config" \
+  --model-root="$AIKERNEL_STATE/models" \
+  --vfs-root="$AIKERNEL_STATE/vfs" \
+  --capability-root="$AIKERNEL_STATE/capabilities" \
+  --urls http://127.0.0.1:8080 &
+monolith_pid=$!
+```
+
+Wait for the listening message, then verify the host in the same shell.
+
+```bash
+curl --fail-with-body -H "Authorization: Bearer $AIKERNEL_API_KEY" http://127.0.0.1:8080/health
+```
+
+Continue with the [admission check and first chat request](https://github.com/AIKernel-NET/AIKernel.NET/blob/dev/docs/overview/upgrade-0-1-4.md) in the same shell. To stop the host, run `kill "$monolith_pid"`. The example registration allows a local test question. Review the policy before using it with other callers.
 
 Equivalent environment variables are supported:
 
@@ -93,6 +134,8 @@ The Core CTG decision gate evaluates the operator-supplied `logos`, `ethos`,
 and `pathos` votes before each completion or embedding request. Missing or unrecognized
 votes deny execution. An Ethos rejection vetoes execution even when the other
 two votes approve. Unknown model IDs return 404 and policy denials return 403.
+
+For an application that needs Bonsai 1.7B to evaluate each operation, construct `BonsaiCtgCouncilEvaluator` explicitly and pass the proposal, host observations and authorization callback separately. Copying the model registration only configures the fixed votes above. [Governed operation example (Japanese)](https://github.com/AIKernel-NET/AIKernel.Core/blob/dev/docs/development/bonsai-ctg-operations-jp.md)
 
 The host appends decisions and execution outcomes to `/config/inference-audit.jsonl`.
 The config mount must be writable by the host. Restrict writes to the model
@@ -597,10 +640,9 @@ and end without `[DONE]`.
 ```bash
 docker build --build-context aikernel-providers=../AIKernel.Providers --build-context aikernel-core=../AIKernel.Core -f docker/Dockerfile.base -t aikernel/monolith:base .
 docker build -f docker/Dockerfile.linux -t aikernel/monolith:linux .
-docker build -f docker/Dockerfile.windows -t aikernel/monolith:windows .
 ```
 
-The base image contains the AOT-compiled monolith binary, entrypoint, and sample configuration. Linux and Windows images extend it with platform-specific native ABI layers.
+The container runs a Linux x64 Native AOT executable and loads Linux shared libraries. On Windows, select Linux containers in Docker Desktop, or run the published `win-x64` executable directly. Native Windows containers are unsupported.
 The native build uses the sibling AIKernel.Core and AIKernel.Providers checkouts.
 Build the C ABI library from AIKernel.Core/native/cuda with CMake and a C
 compiler, and set AIKernelNativeComputeLibrary to the resulting DLL or SO

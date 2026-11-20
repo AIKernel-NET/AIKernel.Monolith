@@ -8,8 +8,7 @@ The `aikernel` Python command is the one-command local AIOS launcher for AIKerne
 
 ```text
 aikernel up
-  -> detect host OS
-  -> select container image
+  -> select the Linux x64 container image
   -> create ~/.aikernel mount roots
   -> docker run
   -> AIKernel.Monolith
@@ -35,7 +34,7 @@ The CLI creates:
 
 ## Container Stack Architecture
 
-Linux hosts use `aikernel/monolith:linux`; Windows hosts use `aikernel/monolith:windows`.
+The CLI runs `aikernel/monolith:linux`. On Windows, select Linux containers in Docker Desktop. To run directly on Windows, use the `win-x64` Native AOT executable.
 
 ## Python CLI Workflow
 

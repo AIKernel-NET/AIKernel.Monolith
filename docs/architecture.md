@@ -20,7 +20,7 @@ client
 - Add model metadata under the external model root.
 - Add capability manifests or binaries under the external capability root.
 - Add VFS content under the external VFS root.
-- Add routing configuration under the external config root.
+- Extend the route table in the host to change route resolution.
 
 ## Determinism Guarantees
 
@@ -41,12 +41,12 @@ The monolith fails closed when any mount is missing.
 
 ## Container Stack Architecture
 
-The base image contains the AOT-compiled monolith and sample configuration. Linux and Windows images extend the base image with platform-specific native ABI surfaces.
+The Linux x64 image packages the AOT host, shared libraries and samples. Windows hosts can use a Linux container engine or run the native `win-x64` executable directly. See the [container guide](container-stack.md).
 
 ## Python CLI Workflow
 
 ```bash
-pip install aikernel-monolith==0.1.1
+pip install ./python
 aikernel init
 aikernel up
 ```

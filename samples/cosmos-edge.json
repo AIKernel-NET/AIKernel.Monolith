@@ -1,0 +1,22 @@
+{
+  "id": "cosmos-edge",
+  "provider": "providers.cosmos-cpu",
+  "model": "cosmos3-edge",
+  "cosmos": {
+    "directory": "edge",
+    "manifestSha256": "8f696d470adeb78ffcc949f804c7c9ac8d7dd5bd9ac350a4a162037120a6c882",
+    "cpuThreads": 4,
+    "contextTokens": 512,
+    "maxNewTokens": 32,
+    "memory": {
+      "maximumResidentBytes": 7000000000,
+      "weightCacheBytes": 3221225472,
+      "kvCacheBytes": 128000000
+    }
+  },
+  "policy": {
+    "logos": "approve",
+    "ethos": "approve",
+    "pathos": "abstain"
+  }
+}
