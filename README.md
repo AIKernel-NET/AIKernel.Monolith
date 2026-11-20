@@ -68,6 +68,8 @@ curl --fail-with-body -H "Authorization: Bearer $AIKERNEL_API_KEY" http://127.0.
 
 Continue with the [admission check and first chat request](https://github.com/AIKernel-NET/AIKernel.NET/blob/dev/docs/overview/upgrade-0-1-4.md) in the same shell. To stop the host, run `kill "$monolith_pid"`. The example registration allows a local test question. Review the policy before using it with other callers.
 
+If another service already uses port 8080, choose a free loopback port. Change it in both `--urls` and the client requests, and check the listening address in the Monolith log before sending the bearer token.
+
 Equivalent environment variables are supported:
 
 ```bash
