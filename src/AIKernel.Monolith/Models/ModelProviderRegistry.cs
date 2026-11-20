@@ -134,7 +134,7 @@ public sealed class ModelProviderRegistry
             }
         }
         var settings = new CosmosCpuSettings(ResolveAsset(mounts.ModelRoot,c.Directory,path),registration.Model,
-            c.ManifestSha256,c.CpuThreads,c.ContextTokens,c.MaxNewTokens,memory);
+            c.ManifestSha256,c.CpuThreads,c.ContextTokens,c.MaxNewTokens,memory,c.ProfilePrefill);
         return new(new(registration.Id,CosmosProviderId,"chat"),null,null,ReadPolicy(registration.Policy),Cosmos:settings);
     }
 
@@ -309,7 +309,8 @@ internal sealed record CosmosCpuRegistration(
     [property: JsonPropertyName("cpuThreads")] int CpuThreads=4,
     [property: JsonPropertyName("contextTokens")] int ContextTokens=512,
     [property: JsonPropertyName("maxNewTokens")] int MaxNewTokens=32,
-    [property: JsonPropertyName("memory")] CosmosPagingRegistration? Memory=null);
+    [property: JsonPropertyName("memory")] CosmosPagingRegistration? Memory=null,
+    [property: JsonPropertyName("profilePrefill")] bool ProfilePrefill=false);
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 internal sealed record CosmosPagingRegistration(
@@ -318,7 +319,7 @@ internal sealed record CosmosPagingRegistration(
     [property: JsonPropertyName("kvCacheBytes")] long? KvCacheBytes=null,
     [property: JsonPropertyName("runtimeReserveBytes")] long? RuntimeReserveBytes=null);
 
-internal sealed record CosmosCpuSettings(string Directory,string Architecture,string ManifestSha256,int Threads,int Context,int MaxNewTokens,CosmosMemoryOptions? Memory)
+internal sealed record CosmosCpuSettings(string Directory,string Architecture,string ManifestSha256,int Threads,int Context,int MaxNewTokens,CosmosMemoryOptions? Memory,bool ProfilePrefill=false)
 {
     internal Cosmos3Variant Variant => Architecture=="cosmos3-edge" ? Cosmos3Variant.Edge : Cosmos3Variant.Nano;
     internal bool HasCheckpoint() => Cosmos3Model.IsCheckpointAvailable(Directory,Variant,ManifestSha256);

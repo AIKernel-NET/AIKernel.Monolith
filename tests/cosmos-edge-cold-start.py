@@ -23,6 +23,9 @@ MESSAGES = [
 ]
 MEASUREMENTS = ("model_load_ms", "checkpoint_verify_ms", "generation_ms", "prefill_ms", "decode_ms",
                 "prefill_weight_page_misses", "weight_backing_reads", "kv_swap_reads")
+PROFILE_FIELDS = {"prefill_start_utc": str, "prefill_process_cpu_ms": float, "prefill_projection_rows_ms": float,
+                  "prefill_projection_page_setup_ms": float, "prefill_attention_ms": float,
+                  "prefill_projection_page_visits": int, "prefill_tile_tokens": int, "prefill_bf16_dot_kernel": str}
 
 
 def idle_samples():
@@ -58,7 +61,7 @@ def memory_counters(process):
     return counters
 
 
-def mount(root, edge):
+def mount(root, edge, profile_prefill=False):
     for name in ("models", "config", "vfs", "capabilities"):
         (root / name).mkdir()
     dest = root / "models/edge"
@@ -76,6 +79,8 @@ def mount(root, edge):
     registration = dict(id=MODEL, provider="providers.cosmos-cpu", model="cosmos3-edge",
                         policy=dict(logos="approve", ethos="approve", pathos="approve"),
                         cosmos=dict(directory="edge", manifestSha256=PIN, cpuThreads=4, memory=MEMORY))
+    if profile_prefill:
+        registration["cosmos"]["profilePrefill"] = True
     (root / "models/reg.json").write_text(json.dumps(registration), encoding="utf-8")
 
 
@@ -87,10 +92,12 @@ def read_audit(path):
     metadata = rows[-1]["Metadata"]
     if (metadata["model_manifest_sha256"], metadata["backend"], int(metadata["input_tokens"])) != (PIN, "cpu", 32):
         raise ValueError("Unexpected checkpoint, backend or token count")
-    excluded = {"request_id", "completion_id", *MEASUREMENTS}
+    excluded = {"request_id", "completion_id", *MEASUREMENTS, *PROFILE_FIELDS}
     stable = [dict(type=r["EventType"], outcome=r["Description"], subject=r["Subject"], severity=r["Severity"],
                    metadata={k: v for k, v in r["Metadata"].items() if k not in excluded}) for r in rows]
-    return stable, {k: int(metadata[k]) if k in metadata else None for k in MEASUREMENTS}
+    measurements = {k: int(metadata[k]) if k in metadata else None for k in MEASUREMENTS}
+    measurements.update({k: convert(metadata[k]) for k, convert in PROFILE_FIELDS.items() if k in metadata})
+    return stable, measurements
 
 
 def run(exe, root):
@@ -146,6 +153,8 @@ def run(exe, root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile-prefill", choices=("candidate", "both"),
+                        help="Record detailed prefill diagnostics in hosts built with profiling support.")
     for name in ("baseline", "candidate", "edge", "output"):
         parser.add_argument("--" + name, required=True, type=Path)
     parser.add_argument("--token-validator", type=Path,
@@ -169,9 +178,12 @@ def main():
         for label in ("baseline", "candidate", "candidate", "baseline"):
             with tempfile.TemporaryDirectory(dir=edge.parent, prefix="cosmos-edge-ab-") as folder:
                 root = Path(folder)
-                mount(root, edge)
+                profile = opts.profile_prefill == "both" or opts.profile_prefill == label
+                mount(root, edge, profile)
                 samples = idle_samples()
                 result = run(builds[label], root)
+            if profile and not PROFILE_FIELDS.keys() <= result["measurements"].keys():
+                raise ValueError("The host did not report the requested prefill profile")
             if label == "candidate":
                 metrics = result["measurements"]
                 if any(metrics[k] is None or metrics[k] < 0 for k in MEASUREMENTS):

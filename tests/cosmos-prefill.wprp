@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsPerformanceRecorder Version="1.0">
+  <Profiles>
+    <SystemCollector Id="CosmosCollector" Name="NT Kernel Logger">
+      <BufferSize Value="256"/>
+      <Buffers Value="128"/>
+    </SystemCollector>
+    <SystemProvider Id="CosmosPagesAndIo">
+      <Keywords>
+        <Keyword Value="ProcessThread"/>
+        <Keyword Value="AllFaults"/>
+        <Keyword Value="HardFaults"/>
+        <Keyword Value="Filename"/>
+        <Keyword Value="FileIO"/>
+        <Keyword Value="FileIOInit"/>
+        <Keyword Value="DiskIO"/>
+        <Keyword Value="DiskIOInit"/>
+      </Keywords>
+    </SystemProvider>
+    <Profile Id="CosmosPrefill.Verbose.File" Name="CosmosPrefill" Description="Page faults and storage activity during Cosmos prefill" LoggingMode="File" DetailLevel="Verbose">
+      <Collectors>
+        <SystemCollectorId Value="CosmosCollector">
+          <SystemProviderId Value="CosmosPagesAndIo"/>
+        </SystemCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

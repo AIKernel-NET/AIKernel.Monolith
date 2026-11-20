@@ -187,6 +187,38 @@ run. In WPA, correlate hard faults and disk activity with the shard paths,
 request UTC interval and host PID from the JSON. Process page faults include
 soft faults. [Windows Performance Recorder profiles](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/recording-for-resource-based-analysis)
 
+For a diagnostic run, set `"profilePrefill": true` in the model's `cosmos`
+registration, or pass `--profile-prefill candidate` to the probe. Use
+`--profile-prefill both` when both executables support it. The private audit
+includes the UTC prefill start, the actual tile length and the BF16 dot kernel
+selected by that executable. On x64 an AVX2-capable CPU can still run
+`scalar-fp64` in a portable Native AOT build. To test the existing AVX2 path,
+publish a second x64 executable from the same commit with
+`-p:IlcInstructionSet=avx2` to a separate output directory and run it on
+compatible hardware. Keep the portable executable for older CPUs.
+
+| Prefill field | What the interval measures |
+| --- | --- |
+| `prefill_projection_page_setup_ms` | Time from entering the projection page cache to receiving the span, including any mapping and prefetch call. `prefill_projection_page_visits` includes cache hits. |
+| `prefill_projection_rows_ms` | Wall time computing projection rows, including worker scheduling and faults incurred while touching the weights. |
+| `prefill_attention_ms` | Head normalization, rotary embeddings, KV handling and causal attention. |
+| `prefill_process_cpu_ms` | User and kernel CPU time of all host threads. Divide by `prefill_ms` for average cores used by the process over this interval. |
+
+The first three wall intervals are disjoint. The residual includes embedding,
+normalization outside attention, activations, and other coordination. To
+investigate SSD stalls in WPA, select the host PID and the interval beginning
+at `prefill_start_utc` and lasting `prefill_ms`. Inspect hard faults, file paths,
+and disk service/wait times together. The probe's process fault counter spans
+the full HTTP request and includes soft faults.
+
+For a separate single-request trace, start
+`wpr -start tests/cosmos-prefill.wprp!CosmosPrefill -filemode` before the
+request and run `wpr -stop cosmos-prefill.etl` after it. The profile records
+all page-fault types and the detailed hard-fault and disk I/O events. In the
+same PID and prefill interval, count faults by type and use the detailed
+hard-fault events to inspect waits. Check for lost ETW events before reporting
+a hard-fault percentage. Keep traced timings separate from the A–B–B–A series.
+
 Send alternating user and assistant messages to `/v1/chat/completions`,
 optionally preceded by one system or developer message. User content accepts
 plain text or an array of text, `image_rgb24`, and `video_rgb24` parts.

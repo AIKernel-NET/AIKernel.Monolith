@@ -10,9 +10,10 @@ public sealed class CosmosRegistrationTests : IDisposable
 {
     private readonly DirectoryInfo root = Directory.CreateTempSubdirectory("cosmos-registration-");
 
-    private CosmosCpuSettings Read(string access, string? memory = null)
+    private CosmosCpuSettings Read(string access, string? memory = null, bool profile = false)
     {
         var options = memory is null ? "" : ",\"memory\":" + memory;
+        if (profile) options += ",\"profilePrefill\":true";
         File.WriteAllText(Path.Combine(root.FullName, "models.json"), $$"""
             {
               "id": "edge", "provider": "providers.cosmos-cpu", "model": "cosmos3-edge",
@@ -27,6 +28,8 @@ public sealed class CosmosRegistrationTests : IDisposable
     [Fact]
     public void PagedSettingsUseCoreDefaultsAndDoNotAllocateDuringRegistration()
     {
+        Assert.False(Read("paged").ProfilePrefill);
+        Assert.True(Read("paged", profile:true).ProfilePrefill);
         var expected = new CosmosMemoryOptions { SwapDirectory = Path.Combine(root.FullName, "model-swap") };
         Assert.Equal(expected, Read("paged").Memory);
         Assert.Equal(expected with { KvCacheBytes = 8388608 }, Read("paged", """{"kvCacheBytes":8388608}""").Memory);

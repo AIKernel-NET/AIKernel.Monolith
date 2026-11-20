@@ -87,7 +87,7 @@ internal sealed class GgufCpuPool : IDisposable
                 model=new Cosmos3Model(settings.Directory,settings.Variant,new CosmosExecutionOptions {
                     CpuThreads=settings.Threads,ContextTokens=settings.Context,EnableThinking=false,
                     ExpectedImportManifestSha256=settings.ManifestSha256,
-                    Memory=settings.Memory
+                    Memory=settings.Memory, ProfilePrefill=settings.ProfilePrefill
                 });
                 currentCosmos=settings;
                 loadMs = (long)Stopwatch.GetElapsedTime(loadStart).TotalMilliseconds;
@@ -104,6 +104,18 @@ internal sealed class GgufCpuPool : IDisposable
             metadata["checkpoint_verify_ms"] = verifyMs.ToString(CultureInfo.InvariantCulture);
             metadata["generation_ms"] = ((long)Stopwatch.GetElapsedTime(generationStart).TotalMilliseconds).ToString(CultureInfo.InvariantCulture);
             metadata["prefill_ms"] = reply.PrefillMilliseconds.ToString(CultureInfo.InvariantCulture);
+            if (reply.PrefillProfile is { } profile)
+            {
+                var culture = CultureInfo.InvariantCulture;
+                metadata["prefill_start_utc"] = profile.StartUtc.ToString("O", culture);
+                metadata["prefill_process_cpu_ms"] = profile.ProcessCpuMilliseconds.ToString("F3", culture);
+                metadata["prefill_projection_rows_ms"] = profile.ProjectionRowsMilliseconds.ToString("F3", culture);
+                metadata["prefill_projection_page_setup_ms"] = profile.ProjectionPageSetupMilliseconds.ToString("F3", culture);
+                metadata["prefill_attention_ms"] = profile.AttentionMilliseconds.ToString("F3", culture);
+                metadata["prefill_projection_page_visits"] = profile.ProjectionPageVisits.ToString(culture);
+                metadata["prefill_tile_tokens"] = profile.TileTokens.ToString(culture);
+                metadata["prefill_bf16_dot_kernel"] = profile.Bf16DotKernel;
+            }
             metadata["decode_ms"] = reply.DecodeMilliseconds.ToString(CultureInfo.InvariantCulture);
             metadata["backend"]="cpu";
             metadata["model_manifest_sha256"]=reply.Artifact!.ManifestSha256;
