@@ -18,7 +18,11 @@ public sealed class GovernedInferenceTests
     public async Task RuntimeReportsTheBuiltHostVersion()
     {
         await using var host = new InferenceHost();
-        var reported = host.Describe().Version.Split('-')[0];
+        var description = host.Describe();
+        Assert.All(new[] { description.ConfigRoot, description.ModelRoot, description.VfsRoot, description.CapabilityRoot,
+            description.Mounts.Config, description.Mounts.Models, description.Mounts.Vfs, description.Mounts.Capabilities },
+            root => Assert.False(Path.IsPathRooted(root)));
+        var reported = description.Version.Split('-')[0];
         Assert.Equal(typeof(SemanticRuntime).Assembly.GetName().Version!.ToString(3), reported);
     }
 

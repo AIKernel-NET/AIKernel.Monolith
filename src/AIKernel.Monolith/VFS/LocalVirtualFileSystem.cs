@@ -34,11 +34,30 @@ public sealed class LocalVirtualFileSystem : IVirtualFileSystem
         var relative = path.TrimStart('/', '\\');
         var full = Path.GetFullPath(Path.Combine(mountOptions.VfsRoot, relative));
         var root = Path.GetFullPath(mountOptions.VfsRoot);
-        if (!full.StartsWith(root, StringComparison.Ordinal))
+        var child = Path.GetRelativePath(root, full);
+        if (Path.IsPathRooted(child) || child == ".." || child.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal))
         {
             throw new InvalidOperationException("VFS path escapes the configured root.");
         }
 
+        var current = root;
+        RejectLink(current);
+        foreach (var part in child.Split(Path.DirectorySeparatorChar))
+        {
+            current = Path.Combine(current, part);
+            RejectLink(current);
+        }
         return full;
+    }
+
+    private static void RejectLink(string path)
+    {
+        try
+        {
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException("Links are not permitted in this VFS.");
+        }
+        catch (FileNotFoundException) { }
+        catch (DirectoryNotFoundException) { }
     }
 }

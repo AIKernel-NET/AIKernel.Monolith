@@ -16,7 +16,7 @@ public sealed class CapabilityAssemblyLoader : ICapabilityAssemblyLoader
         var extension = Path.GetExtension(descriptor.Path).ToLowerInvariant();
         var supported = extension is ".json" or ".dll" or ".so";
         return supported
-            ? new CapabilityLoadRecord(descriptor, true, "loaded")
+            ? new CapabilityLoadRecord(descriptor, false, "discovered")
             : new CapabilityLoadRecord(descriptor, false, $"Unsupported capability artifact: {extension}");
     }
 }

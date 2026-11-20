@@ -13,10 +13,8 @@ public sealed class SemanticRuntime
 {
     private static readonly string HostVersion = typeof(SemanticRuntime).Assembly
         .GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion.Split('+', 2)[0];
-    private readonly MountOptions mountOptions;
-    private readonly CapabilityLoader capabilityLoader;
+    private readonly Lazy<IReadOnlyList<string>> capabilityIds;
     private readonly ModelProviderRegistry modelProviderRegistry;
-    private readonly MountTable mountTable;
     private readonly Routing.IRouter router;
 
     /// <summary>
@@ -29,10 +27,10 @@ public sealed class SemanticRuntime
         MountTable mountTable,
         Routing.IRouter router)
     {
-        this.mountOptions = mountOptions;
-        this.capabilityLoader = capabilityLoader;
+        ArgumentNullException.ThrowIfNull(mountOptions);
+        capabilityIds = new Lazy<IReadOnlyList<string>>(() => Array.AsReadOnly(capabilityLoader.Scan().Select(x => x.Id).ToArray()));
         this.modelProviderRegistry = modelProviderRegistry;
-        this.mountTable = mountTable;
+        ArgumentNullException.ThrowIfNull(mountTable);
         this.router = router;
     }
 
@@ -43,13 +41,13 @@ public sealed class SemanticRuntime
         => new(
             "AIKernel.Monolith",
             HostVersion,
-            mountOptions.ConfigRoot,
-            mountOptions.ModelRoot,
-            mountOptions.VfsRoot,
-            mountOptions.CapabilityRoot,
-            capabilityLoader.Scan().Select(x => x.Id).ToArray(),
+            "config",
+            "models",
+            "vfs",
+            "capabilities",
+            capabilityIds.Value,
             modelProviderRegistry.ListModels().Select(x => x.Id).ToArray(),
-            mountTable.Describe(),
+            new MountDescription("config", "models", "vfs", "capabilities"),
             router.GetType().Name);
 }
 
