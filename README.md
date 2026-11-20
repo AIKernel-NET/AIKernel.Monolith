@@ -171,13 +171,15 @@ It uses four CPU workers, the 32-token arithmetic case, a 1 GiB weight cache
 and a 7,000,000,000-byte process budget.
 
 ```powershell
-py tests/cosmos-edge-cold-start.py --baseline old/AIKernel.Monolith.exe --candidate new/AIKernel.Monolith.exe --edge D:/models/Edge --output edge-comparison.jsonl
+py tests/cosmos-edge-cold-start.py --baseline old/AIKernel.Monolith.exe --candidate new/AIKernel.Monolith.exe --edge D:/models/Edge --output edge-comparison.jsonl --token-validator new-tools/AIKernel.Inference.Optimization.Validation.exe
 ```
 
 The four runs alternate in A–B–B–A order and preserve the system file cache.
 Each JSON line records the HTTP response time, audit counters, peak working
 set, and process page faults. The probe checks the answer, finish reason,
-input token count, and the policy and execution audit records. Missing timing
+input token count, and the policy and execution audit records. The optional
+`--token-validator` runs the candidate Core validation tool after the timed
+requests and compares its generated IDs with the original `[1052, 11]`. Missing timing
 fields in an older executable appear as `null`. To identify physical storage
 waits, capture WPR's General, Disk I/O and File I/O profiles in a separate
 run. In WPA, correlate hard faults and disk activity with the shard paths,

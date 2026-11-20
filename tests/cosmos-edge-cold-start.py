@@ -148,12 +148,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("baseline", "candidate", "edge", "output"):
         parser.add_argument("--" + name, required=True, type=Path)
+    parser.add_argument("--token-validator", type=Path,
+                        help="Candidate AIKernel.Inference.Optimization.Validation executable for exact token parity")
     opts = parser.parse_args()
     if os.name != "nt":
         parser.error("The working-set and CPU counters require Windows.")
     if opts.output.exists():
         parser.error("Choose a new output file for each comparison.")
     builds = {"baseline": opts.baseline.resolve(strict=True), "candidate": opts.candidate.resolve(strict=True)}
+    validator = opts.token_validator.resolve(strict=True) if opts.token_validator else None
     hashes = {}
     for name, path in builds.items():
         with path.open("rb") as handle:
@@ -182,6 +185,21 @@ def main():
             if not matches:
                 raise ValueError("Stable governance or inference audit fields changed")
             reference_audit = result["audit"]
+        if validator:
+            with tempfile.TemporaryDirectory(dir=edge.parent, prefix="cosmos-edge-token-check-") as folder:
+                root = Path(folder)
+                memory = dict(MEMORY, swapDirectory=str(root / "swap"), expectedImportManifestSha256=PIN)
+                request = dict(system=MESSAGES[0]["content"], content=MESSAGES[1]["content"],
+                               enableThinking=False, maxNewTokens=32, memory=memory)
+                (root / "request.json").write_text(json.dumps(request), encoding="utf-8")
+                idle_samples()
+                subprocess.run([str(validator), "--cosmos-generate", str(edge), "request.json", "result.json"],
+                               cwd=root, env=dict(os.environ, DOTNET_PROCESSOR_COUNT="4"), check=True, timeout=1250)
+                result = json.loads((root / "result.json").read_bytes())
+                reference = (result["InputTokens"], result["TokenIds"], result["Text"], result["FinishReason"])
+                if reference != (32, [1052, 11], "4", "stop"):
+                    raise ValueError("Generated token sequence differed from the original reference")
+                report.write(json.dumps(dict(check="referenceTokens", tokenIds=result["TokenIds"], matches=True)) + "\n")
 
 
 if __name__ == "__main__":
