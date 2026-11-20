@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Globalization;
 using AIKernel.Common.Results;
 using AIKernel.Kernel.Inference;
 using AIKernel.Monolith.OpenAI;
@@ -76,8 +78,10 @@ internal sealed class GgufCpuPool : IDisposable
             ObjectDisposedException.ThrowIf(disposed,this);
             using var input = new CosmosChatInput();
             if (!input.Read(messages,settings.Architecture)) return Failure("invalid_messages");
+            long loadMs = 0, verifyMs = 0;
             if (currentCosmos!=settings)
             {
+                long loadStart = Stopwatch.GetTimestamp();
                 if (!settings.HasCheckpoint()) return Failure("checkpoint_unavailable");
                 model?.Dispose(); model=null; generate=null; current=null; currentCosmos=null;
                 model=new Cosmos3Model(settings.Directory,settings.Variant,new CosmosExecutionOptions {
@@ -86,19 +90,28 @@ internal sealed class GgufCpuPool : IDisposable
                     Memory=settings.Memory
                 });
                 currentCosmos=settings;
+                loadMs = (long)Stopwatch.GetElapsedTime(loadStart).TotalMilliseconds;
+                verifyMs = ((Cosmos3Model)model).VerificationMilliseconds;
             }
             var cosmos=(Cosmos3Model)model!;
             var before=cosmos.MemoryStatistics;
             CosmosGeneration reply;
+            long generationStart = Stopwatch.GetTimestamp();
             try { reply=await cosmos.GenerateChatAsync(input.System,input.History,input.User,settings.MaxNewTokens,token); }
             catch (ArgumentException) { return Failure("context_length_exceeded"); }
             token.ThrowIfCancellationRequested();
+            metadata["model_load_ms"] = loadMs.ToString(CultureInfo.InvariantCulture);
+            metadata["checkpoint_verify_ms"] = verifyMs.ToString(CultureInfo.InvariantCulture);
+            metadata["generation_ms"] = ((long)Stopwatch.GetElapsedTime(generationStart).TotalMilliseconds).ToString(CultureInfo.InvariantCulture);
+            metadata["prefill_ms"] = reply.PrefillMilliseconds.ToString(CultureInfo.InvariantCulture);
+            metadata["decode_ms"] = reply.DecodeMilliseconds.ToString(CultureInfo.InvariantCulture);
             metadata["backend"]="cpu";
             metadata["model_manifest_sha256"]=reply.Artifact!.ManifestSha256;
             metadata["input_tokens"]=reply.InputTokens.ToString(System.Globalization.CultureInfo.InvariantCulture);
             if (before is not null && cosmos.MemoryStatistics is { } after)
             {
                 var format=System.Globalization.CultureInfo.InvariantCulture;
+                metadata["prefill_weight_page_misses"] = reply.PrefillWeightPageMisses.ToString(format);
                 metadata["weight_backing_reads"]=(after.WeightBackingReads-before.WeightBackingReads).ToString(format);
                 metadata["kv_swap_reads"]=(after.KvSwapReads-before.KvSwapReads).ToString(format);
             }

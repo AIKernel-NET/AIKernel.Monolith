@@ -148,8 +148,41 @@ for process RSS, 5,000,000,000 for weights, 128,000,000 for KV and
 1,000,000,000 for `runtimeReserveBytes`. The runtime adjusts cache capacity
 within the cooperative RSS budget. Use an OS limit when a hard ceiling is
 required. To exercise encrypted KV spill, set `kvCacheBytes` to 8,388,608.
-Successful paged requests record `weight_backing_reads` and `kv_swap_reads`
-in the private inference audit. These are read counts during generation.
+When the text weights exceed the available cache, Cosmos processes the prompt
+in tiles of up to 32 tokens. Each projection visits its weight pages once per
+tile. Attention consumes tokens in order and restores earlier tiles' KV data.
+The runtime reserves scratch space first and reduces the tile size under memory
+pressure. Each generated token still requires a separate decode step.
+
+The private inference audit records `model_load_ms` (including
+`checkpoint_verify_ms`) and `generation_ms` (including `prefill_ms` and
+`decode_ms`). Model load and verification are zero on reuse. Text prefill
+starts after tokenization and vision encoding. `weight_backing_reads` counts
+logical weight page misses during generation, `prefill_weight_page_misses`
+counts the prefill subset, and `kv_swap_reads` counts reads from KV swap.
+On Windows, cached weight bytes cover the encoded contents of open read-only
+file views. Use the process peak working set to check the resident budget.
+
+To reproduce the Windows first-request comparison, use Python 3.11+ with the
+two published Native AOT executables and the original imported Edge directory.
+The probe creates temporary hard links next to the import, waits for two
+15-second CPU samples at or below 10%, and starts a fresh host for each run.
+It uses four CPU workers, the 32-token arithmetic case, a 1 GiB weight cache
+and a 7,000,000,000-byte process budget.
+
+```powershell
+py tests/cosmos-edge-cold-start.py --baseline old/AIKernel.Monolith.exe --candidate new/AIKernel.Monolith.exe --edge D:/models/Edge --output edge-comparison.jsonl
+```
+
+The four runs alternate in A–B–B–A order and preserve the system file cache.
+Each JSON line records the HTTP response time, audit counters, peak working
+set, and process page faults. The probe checks the answer, finish reason,
+input token count, and the policy and execution audit records. Missing timing
+fields in an older executable appear as `null`. To identify physical storage
+waits, capture WPR's General, Disk I/O and File I/O profiles in a separate
+run. In WPA, correlate hard faults and disk activity with the shard paths,
+request UTC interval and host PID from the JSON. Process page faults include
+soft faults. [Windows Performance Recorder profiles](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/recording-for-resource-based-analysis)
 
 Send alternating user and assistant messages to `/v1/chat/completions`,
 optionally preceded by one system or developer message. User content accepts
