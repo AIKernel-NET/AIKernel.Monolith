@@ -10,9 +10,7 @@
     <AssemblyName>AIKernel.Monolith</AssemblyName>
     <AssemblyTitle>AIKernel.Monolith</AssemblyTitle>
     <PackageId>AIKernel.Monolith</PackageId>
-    <Version>0.1.1</Version>
-    <AssemblyVersion>0.1.1.0</AssemblyVersion>
-    <FileVersion>0.1.1.0</FileVersion>
+    <Version>0.1.4</Version>
     <AIKernelKernelProject Condition="'$(AIKernelKernelProject)' == ''">$(MSBuildThisFileDirectory)../../../AIKernel.Core/src/AIKernel.Kernel/AIKernel.Kernel.csproj</AIKernelKernelProject>
     <ChatOpenAIProviderProject Condition="'$(ChatOpenAIProviderProject)' == ''">$(MSBuildThisFileDirectory)../../../AIKernel.Providers/src/Chat/ChatOpenAIProvider/ChatOpenAIProvider.csproj</ChatOpenAIProviderProject>
     <PublishAot Condition="'$(PublishAot)' == '' and Exists('$(ChatOpenAIProviderProject)')">true</PublishAot>

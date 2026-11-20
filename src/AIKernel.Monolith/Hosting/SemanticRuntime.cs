@@ -1,3 +1,4 @@
+using System.Reflection;
 using AIKernel.Monolith.Capabilities;
 using AIKernel.Monolith.Models;
 using AIKernel.Monolith.Routing;
@@ -10,6 +11,8 @@ namespace AIKernel.Monolith.Hosting;
 /// </summary>
 public sealed class SemanticRuntime
 {
+    private static readonly string HostVersion = typeof(SemanticRuntime).Assembly
+        .GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion.Split('+', 2)[0];
     private readonly MountOptions mountOptions;
     private readonly CapabilityLoader capabilityLoader;
     private readonly ModelProviderRegistry modelProviderRegistry;
@@ -39,7 +42,7 @@ public sealed class SemanticRuntime
     public RuntimeDescription Describe()
         => new(
             "AIKernel.Monolith",
-            "0.1.1",
+            HostVersion,
             mountOptions.ConfigRoot,
             mountOptions.ModelRoot,
             mountOptions.VfsRoot,

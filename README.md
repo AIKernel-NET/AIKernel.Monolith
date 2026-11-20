@@ -133,6 +133,24 @@ governance policy as for other local models. The default `weightAccess` is
 `"paged"`. A workstation with sufficient RAM can use `"mapped"`. Both modes
 verify the checkpoint on load. Admission checks metadata and shard presence.
 
+To reproduce the Server profile, add this object inside `cosmos`:
+
+```json
+"memory": {
+  "maximumResidentBytes": 7000000000,
+  "weightCacheBytes": 3221225472,
+  "kvCacheBytes": 128000000
+}
+```
+
+Each field is optional in paged mode. The defaults are 7,000,000,000 bytes
+for process RSS, 5,000,000,000 for weights, 128,000,000 for KV and
+1,000,000,000 for `runtimeReserveBytes`. The runtime adjusts cache capacity
+within the cooperative RSS budget. Use an OS limit when a hard ceiling is
+required. To exercise encrypted KV spill, set `kvCacheBytes` to 8,388,608.
+Successful paged requests record `weight_backing_reads` and `kv_swap_reads`
+in the private inference audit. These are read counts during generation.
+
 Send alternating user and assistant messages to `/v1/chat/completions`,
 optionally preceded by one system or developer message. User content accepts
 plain text or an array of text, `image_rgb24`, and `video_rgb24` parts.

@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using System.Text.Json;
 using AIKernel.Kernel.Inference;
 using AIKernel.Monolith.OpenAI;
@@ -13,28 +12,6 @@ internal sealed class CosmosChatInput : IDisposable
     private readonly List<byte[]> pixels = [];
     private int patches;
     private long textLength;
-
-    internal static bool HasCheckpoint(CosmosCpuSettings settings)
-    {
-        var root=settings.Directory;
-        try
-        {
-            if (!File.Exists(Path.Combine(root,"model.safetensors.index.json"))) return false;
-            using var file=File.OpenRead(Path.Combine(root,"import-manifest.json"));
-            if (file.Length is <2 or >1_048_576 ||
-                !Convert.ToHexString(SHA256.HashData(file)).Equals(settings.ManifestSha256,StringComparison.OrdinalIgnoreCase)) return false;
-            file.Position=0;
-            using var manifest=JsonDocument.Parse(file);
-            var data=manifest.RootElement;
-            var repo=settings.Architecture=="cosmos3-edge"?"nvidia/Cosmos3-Edge":"nvidia/Cosmos3-Nano";
-            var shards=data.GetProperty("shards");
-            return data.GetProperty("repository").GetString()==repo &&
-                shards.ValueKind==JsonValueKind.Array && shards.GetArrayLength() is >0 and <=32 &&
-                shards.EnumerateArray().All(s=>s.GetProperty("output").GetString() is { Length:>0 } n &&
-                    n.IndexOfAny(['/', '\\', ':'])<0 && n.EndsWith(".safetensors",StringComparison.Ordinal) && File.Exists(Path.Combine(root,n)));
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException or KeyNotFoundException) { return false; }
-    }
 
     internal bool Read(IReadOnlyList<ChatMessage> messages,string architecture)
     {

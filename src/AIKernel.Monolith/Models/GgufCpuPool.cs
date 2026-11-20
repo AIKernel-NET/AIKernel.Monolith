@@ -30,6 +30,7 @@ internal sealed class GgufCpuPool : IDisposable
             ObjectDisposedException.ThrowIf(disposed,this);
             if (current != settings)
             {
+                if (!File.Exists(settings.Checkpoint)) return Failure("checkpoint_unavailable");
                 model?.Dispose();
                 current=null; currentCosmos=null; model=null; generate=null;
                 switch (settings.Architecture)
@@ -60,6 +61,8 @@ internal sealed class GgufCpuPool : IDisposable
             return Result<string>.Success(reply.FinishReason);
         }
         catch (NotSupportedException) { return Failure("unsupported_model_format"); }
+        catch (FileNotFoundException) { return Failure("checkpoint_unavailable"); }
+        catch (DirectoryNotFoundException) { return Failure("checkpoint_unavailable"); }
         catch (OutOfMemoryException) { return Failure("local_memory_exhausted"); }
         finally { lease.Release(); }
     }
@@ -75,23 +78,30 @@ internal sealed class GgufCpuPool : IDisposable
             if (!input.Read(messages,settings.Architecture)) return Failure("invalid_messages");
             if (currentCosmos!=settings)
             {
+                if (!settings.HasCheckpoint()) return Failure("checkpoint_unavailable");
                 model?.Dispose(); model=null; generate=null; current=null; currentCosmos=null;
-                if (!CosmosChatInput.HasCheckpoint(settings)) return Failure("checkpoint_unavailable");
-                var variant=settings.Architecture=="cosmos3-edge"?Cosmos3Variant.Edge:Cosmos3Variant.Nano;
-                model=new Cosmos3Model(settings.Directory,variant,new CosmosExecutionOptions {
+                model=new Cosmos3Model(settings.Directory,settings.Variant,new CosmosExecutionOptions {
                     CpuThreads=settings.Threads,ContextTokens=settings.Context,EnableThinking=false,
                     ExpectedImportManifestSha256=settings.ManifestSha256,
-                    Memory=settings.WeightAccess=="paged" ? new CosmosMemoryOptions {SwapDirectory=settings.SwapDirectory} : null
+                    Memory=settings.Memory
                 });
                 currentCosmos=settings;
             }
+            var cosmos=(Cosmos3Model)model!;
+            var before=cosmos.MemoryStatistics;
             CosmosGeneration reply;
-            try { reply=await ((Cosmos3Model)model!).GenerateChatAsync(input.System,input.History,input.User,settings.MaxNewTokens,token); }
+            try { reply=await cosmos.GenerateChatAsync(input.System,input.History,input.User,settings.MaxNewTokens,token); }
             catch (ArgumentException) { return Failure("context_length_exceeded"); }
             token.ThrowIfCancellationRequested();
             metadata["backend"]="cpu";
             metadata["model_manifest_sha256"]=reply.Artifact!.ManifestSha256;
             metadata["input_tokens"]=reply.InputTokens.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (before is not null && cosmos.MemoryStatistics is { } after)
+            {
+                var format=System.Globalization.CultureInfo.InvariantCulture;
+                metadata["weight_backing_reads"]=(after.WeightBackingReads-before.WeightBackingReads).ToString(format);
+                metadata["kv_swap_reads"]=(after.KvSwapReads-before.KvSwapReads).ToString(format);
+            }
             if (reply.Text.Length>0) await onChunk(reply.Text);
             return Result<string>.Success(reply.FinishReason);
         }

@@ -4,6 +4,7 @@ using AIKernel.Dtos.Governance;
 using AIKernel.Enums.Governance;
 using AIKernel.Core.Governance;
 using AIKernel.Core.Memory;
+using AIKernel.Kernel.Inference;
 using AIKernel.Monolith.Hosting;
 using AIKernel.Monolith.Internal;
 using AIKernel.Monolith.Models.Local;
@@ -112,10 +113,28 @@ public sealed class ModelProviderRegistry
             || registration.Model is not ("cosmos3-edge" or "cosmos3-nano")
             || c.ManifestSha256 is not { Length:64 } || !c.ManifestSha256.All(Uri.IsHexDigit)
             || c.WeightAccess is not ("paged" or "mapped") || c.CpuThreads is <1 or >6 || c.ContextTokens is <32 or >2048
-            || c.MaxNewTokens is <1 or >256 || c.MaxNewTokens >= c.ContextTokens)
+            || c.MaxNewTokens is <1 or >256 || c.MaxNewTokens >= c.ContextTokens
+            || (c.WeightAccess == "mapped" && c.Memory is not null))
             throw new InvalidDataException($"Invalid Cosmos registration in '{path}'.");
+        CosmosMemoryOptions? memory = null;
+        if (c.WeightAccess == "paged")
+        {
+            var defaults = new CosmosMemoryOptions { SwapDirectory = Path.Combine(mounts.ConfigRoot, "model-swap") };
+            memory = defaults with
+            {
+                MaximumResidentBytes = c.Memory?.MaximumResidentBytes ?? defaults.MaximumResidentBytes,
+                WeightCacheBytes = c.Memory?.WeightCacheBytes ?? defaults.WeightCacheBytes,
+                KvCacheBytes = c.Memory?.KvCacheBytes ?? defaults.KvCacheBytes,
+                RuntimeReserveBytes = c.Memory?.RuntimeReserveBytes ?? defaults.RuntimeReserveBytes
+            };
+            try { memory.Validate(); }
+            catch (ArgumentOutOfRangeException ex)
+            {
+                throw new InvalidDataException($"Invalid Cosmos memory budget in '{path}'.", ex);
+            }
+        }
         var settings = new CosmosCpuSettings(ResolveAsset(mounts.ModelRoot,c.Directory,path),registration.Model,
-            c.ManifestSha256,c.WeightAccess,c.CpuThreads,c.ContextTokens,c.MaxNewTokens,Path.Combine(mounts.ConfigRoot,"model-swap"));
+            c.ManifestSha256,c.CpuThreads,c.ContextTokens,c.MaxNewTokens,memory);
         return new(new(registration.Id,CosmosProviderId,"chat"),null,null,ReadPolicy(registration.Policy),Cosmos:settings);
     }
 
@@ -289,9 +308,21 @@ internal sealed record CosmosCpuRegistration(
     [property: JsonPropertyName("weightAccess")] string WeightAccess="paged",
     [property: JsonPropertyName("cpuThreads")] int CpuThreads=4,
     [property: JsonPropertyName("contextTokens")] int ContextTokens=512,
-    [property: JsonPropertyName("maxNewTokens")] int MaxNewTokens=32);
+    [property: JsonPropertyName("maxNewTokens")] int MaxNewTokens=32,
+    [property: JsonPropertyName("memory")] CosmosPagingRegistration? Memory=null);
 
-internal sealed record CosmosCpuSettings(string Directory,string Architecture,string ManifestSha256,string WeightAccess,int Threads,int Context,int MaxNewTokens,string SwapDirectory);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+internal sealed record CosmosPagingRegistration(
+    [property: JsonPropertyName("maximumResidentBytes")] long? MaximumResidentBytes=null,
+    [property: JsonPropertyName("weightCacheBytes")] long? WeightCacheBytes=null,
+    [property: JsonPropertyName("kvCacheBytes")] long? KvCacheBytes=null,
+    [property: JsonPropertyName("runtimeReserveBytes")] long? RuntimeReserveBytes=null);
+
+internal sealed record CosmosCpuSettings(string Directory,string Architecture,string ManifestSha256,int Threads,int Context,int MaxNewTokens,CosmosMemoryOptions? Memory)
+{
+    internal Cosmos3Variant Variant => Architecture=="cosmos3-edge" ? Cosmos3Variant.Edge : Cosmos3Variant.Nano;
+    internal bool HasCheckpoint() => Cosmos3Model.IsCheckpointAvailable(Directory,Variant,ManifestSha256);
+}
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 internal sealed record GgufCpuRegistration(

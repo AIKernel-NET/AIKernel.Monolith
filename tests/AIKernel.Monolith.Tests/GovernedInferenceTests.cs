@@ -14,6 +14,14 @@ namespace AIKernel.Monolith.Tests;
 
 public sealed class GovernedInferenceTests
 {
+    [Fact]
+    public async Task RuntimeReportsTheBuiltHostVersion()
+    {
+        await using var host = new InferenceHost();
+        var reported = host.Describe().Version.Split('-')[0];
+        Assert.Equal(typeof(SemanticRuntime).Assembly.GetName().Version!.ToString(3), reported);
+    }
+
     [Theory]
     [InlineData("/v1/chat/completions")]
     [InlineData("/v1/completions")]
@@ -73,6 +81,21 @@ public sealed class GovernedInferenceTests
         Assert.Equal("Deny", audit.GetProperty("Metadata").GetProperty("decision").GetString());
     }
 
+    [Theory]
+    [InlineData("gpt-missing")]
+    [InlineData("cosmos-missing")]
+    public async Task MissingCheckpointReturnsServiceUnavailableAndRecordsTheFailure(string model)
+    {
+        await using var host = new InferenceHost();
+        var (status, body) = await host.SendAsync("/v1/chat/completions", model);
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, status);
+        Assert.Contains("checkpoint_unavailable", body);
+        Assert.Collection(host.ReadAudit(),
+            entry => AssertAudit(entry, "inference.policy", "allowed", model),
+            entry => AssertAudit(entry, "inference.execution", "checkpoint_unavailable", model));
+        Assert.Empty(host.Upstream.Calls);
+    }
+
     [Fact]
     public async Task AuditWriteFailurePreventsTheProviderCall()
     {
@@ -106,6 +129,12 @@ public sealed class GovernedInferenceTests
             AuditPath = Path.Combine(config, "inference-audit.jsonl");
             File.WriteAllText(Path.Combine(models, "models.json"), """
                 [
+                  { "id": "gpt-missing", "provider":"providers.gguf-cpu", "model":"gpt-oss-20b",
+                    "policy":{"logos":"approve","ethos":"approve","pathos":"approve"},
+                    "gguf":{"checkpoint":"not-installed.gguf"} },
+                  { "id": "cosmos-missing", "provider":"providers.cosmos-cpu", "model":"cosmos3-edge",
+                    "policy":{"logos":"approve","ethos":"approve","pathos":"approve"},
+                    "cosmos":{"directory":"not-installed","manifestSha256":"0000000000000000000000000000000000000000000000000000000000000000"} },
                   { "id": "cosmos-no-policy", "provider":"providers.cosmos-cpu", "model":"cosmos3-edge",
                     "cosmos":{"directory":"edge","manifestSha256":"0000000000000000000000000000000000000000000000000000000000000000"} },
                   { "id": "cpu-no-policy", "provider":"providers.gguf-cpu", "model":"qwen3",
@@ -134,7 +163,8 @@ public sealed class GovernedInferenceTests
 
             Upstream = new FakeUpstream(AuditPath);
             var builder = WebApplication.CreateBuilder([]);
-            builder.Services.AddAIKernelMonolith(new MountOptions(config, models, root.FullName, root.FullName));
+            builder.Services.AddAIKernelMonolith(new MountOptions(config, models,
+                root.CreateSubdirectory("vfs").FullName, root.CreateSubdirectory("capabilities").FullName));
             builder.Services.AddHttpClient("monolith-inference")
                 .ConfigurePrimaryHttpMessageHandler(() => Upstream);
             app = builder.Build();
@@ -143,6 +173,7 @@ public sealed class GovernedInferenceTests
 
         public string AuditPath { get; }
         public FakeUpstream Upstream { get; }
+        public RuntimeDescription Describe() => app.Services.GetRequiredService<SemanticRuntime>().Describe();
 
         public async Task<(int Status, string Body)> SendAsync(string route, string model)
         {
