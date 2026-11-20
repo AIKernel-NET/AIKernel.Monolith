@@ -47,11 +47,15 @@ aikernel-local/
   capabilities/
 ```
 
-Start the host in the background so the client commands in the same shell inherit its bearer token. Monolith writes its audit log under the config root.
+Build the host in Release mode. After the build succeeds, start its DLL in the background so the client commands in the same shell inherit its bearer token. Monolith writes its audit log under the config root.
+
+```bash
+dotnet build src/AIKernel.Monolith/AIKernel.Monolith.csproj -c Release
+```
 
 ```bash
 export AIKERNEL_API_KEY="$(openssl rand -hex 32)"
-dotnet run --project src/AIKernel.Monolith/AIKernel.Monolith.csproj -- \
+dotnet src/AIKernel.Monolith/bin/Release/net10.0/AIKernel.Monolith.dll \
   --config-root="$AIKERNEL_STATE/config" \
   --model-root="$AIKERNEL_STATE/models" \
   --vfs-root="$AIKERNEL_STATE/vfs" \
